@@ -1,0 +1,15 @@
+# Node modules
+backend/node_modules/
+frontend/node_modules/
+node_modules/
+
+# 환경변수 파일
+backend/.env
+.env
+backend/serviceAccountKey.json
+
+# 기타
+*.log
+
+# Python virtual env
+venv/
