@@ -1,15 +1,51 @@
-# Node modules
-backend/node_modules/
-frontend/node_modules/
+# ------------------------
+# OS / Editor
+# ------------------------
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# ------------------------
+# Node / React
+# ------------------------
 node_modules/
-
-# 환경변수 파일
-backend/.env
-.env
-backend/serviceAccountKey.json
-
-# 기타
+frontend/node_modules/
+backend/node_modules/
+npm-debug.log*
+yarn.lock
+pnpm-lock.yaml
+package-lock.json
+dist/
+build/
+.cache/
 *.log
 
-# Python virtual env
+# ------------------------
+# Environment / Secrets
+# ------------------------
+.env
+.env.*
+!.env.example
+frontend/.env
+backend/.env
+backend/serviceAccountKey.json
+
+# ------------------------
+# Python
+# ------------------------
 venv/
+.venv/
+__pycache__/
+*.pyc
+
+# ------------------------
+# Misc
+# ------------------------
+coverage/
+.tmp/
+*.local
+
+# tree
+tree.xtx

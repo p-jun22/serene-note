@@ -1,18 +1,25 @@
-// gptService.js - GPT 분석 + 신뢰도 계산 포함
-
+// backend/gptService.js
 const { ChatOpenAI } = require('@langchain/openai');
 const { PromptTemplate } = require('@langchain/core/prompts');
 
+const MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
+const API_KEY = process.env.OPENAI_API_KEY;
+
+if (!API_KEY) {
+  console.warn('[gptService] OPENAI_API_KEY 미설정: 서버 구동은 되지만, 호출 시 500을 반환합니다.');
+}
+
 const llm = new ChatOpenAI({
-  modelName: 'gpt-4o',
-  openAIApiKey: process.env.OPENAI_API_KEY
+  modelName: MODEL,
+  openAIApiKey: API_KEY,
+  temperature: 0.2,
 });
 
 const template = `
-다음 사용자 입력을 분석해서 아래 JSON 형식을 그대로 따르세요.
-
-입력: {user_input}
-
+반드시 아래 JSON 형식을 그대로 따르세요.
+- 설명 추가 금지
+- 코드블럭 사용 금지
+- key 순서 유지
 형식:
 {{
   "감정": ["감정1", "감정2"],
@@ -20,64 +27,50 @@ const template = `
   "핵심믿음": "문장",
   "추천질문": "문장"
 }}
+
+입력: {user_input}
 `;
 
 const prompt = new PromptTemplate({
-  template: template,
-  inputVariables: ['user_input']
+  template,
+  inputVariables: ['user_input'],
 });
 
-// Plutchik + Ekman + Beck 기반 정규화
-const BECK_DISTORTIONS = [
-  "이분법적 사고", "과잉 일반화", "정신적 여과", "긍정적인 것 무시하기",
-  "성급한 결론 도출", "확대 및 축소", "감정적 추리", "해야 한다 진술",
-  "낙인찍기", "개인화", "운명화", "통제의 오류", "독심술", "예언하기", "비난"
-];
-
-const EMOTIONS_STANDARD = [
-  "기쁨", "신뢰", "두려움", "놀람", "슬픔", "혐오", "분노", "기대",
-  "사랑", "경악", "외로움", "절망", "수용", "애착", "불안", "좌절",
-  "짜증", "증오", "자부심", "수치심", "후회", "멸시", "경멸", "흥미"
-];
-
-function calcSchemaMatch(json) {
-  const 감정일치율 = json.감정.filter(e => EMOTIONS_STANDARD.includes(e)).length / json.감정.length;
-  const 왜곡일치율 = json.인지왜곡.filter(e => BECK_DISTORTIONS.includes(e)).length / json.인지왜곡.length;
-  return (감정일치율 + 왜곡일치율) / 2;
-}
-
-function calcConsistencyScore(json) {
-  const 핵심 = json.핵심믿음;
-  return json.감정.some(e => 핵심.includes(e)) ? 1 : 0.5;
-}
-
-function calcTotalScore(userScore, schemaScore, consistencyScore) {
-  return (userScore * 0.4) + (schemaScore * 0.3) + (consistencyScore * 0.3);
-}
-
 async function runCBTAnalysis(userInput) {
+  if (!API_KEY) {
+    const e = new Error('OPENAI_API_KEY not set');
+    e.code = 'NO_API_KEY';
+    throw e;
+  }
+
   const promptText = await prompt.format({ user_input: userInput });
   const response = await llm.invoke(promptText);
 
-  if (!response || !response.content) {
-    throw new Error('GPT 응답이 비어 있습니다.');
-  }
+  if (!response || !response.content) throw new Error('GPT 응답이 비어 있습니다.');
 
-  let content = response.content.trim();
-  if (content.startsWith("```")) {
-    content = content.replace(/```json|```/g, '').trim();
-  }
+  let content = String(response.content).trim();
+  if (content.startsWith('```')) content = content.replace(/```json|```/g, '').trim();
 
+  // ✅ JSON 파싱 시 폴백
   try {
     const parsed = JSON.parse(content);
-    const schemaScore = calcSchemaMatch(parsed);
-    const consistencyScore = calcConsistencyScore(parsed);
-    const totalScore = calcTotalScore(1, schemaScore, consistencyScore);
-    return { ...parsed, schemaScore, consistencyScore, totalScore };
+    // 최소 필드 보정
+    return {
+      감정: Array.isArray(parsed.감정) ? parsed.감정 : (parsed.감정 ? [parsed.감정] : []),
+      인지왜곡: Array.isArray(parsed.인지왜곡) ? parsed.인지왜곡 : (parsed.인지왜곡 ? [parsed.인지왜곡] : []),
+      핵심믿음: typeof parsed.핵심믿음 === 'string' ? parsed.핵심믿음 : '',
+      추천질문: typeof parsed.추천질문 === 'string' ? parsed.추천질문 : '',
+    };
   } catch (err) {
-    console.error("GPT JSON 파싱 오류:", err);
-    console.log("GPT 원본 응답:", content);
-    throw new Error('GPT 응답 형식 오류 발생');
+    console.error('GPT JSON 파싱 오류:', err);
+    console.log('GPT 원본 응답:', content);
+    // 폴백: 비정형 응답이라도 UI가 죽지 않도록
+    return {
+      감정: [],
+      인지왜곡: [],
+      핵심믿음: '',
+      추천질문: (content || '').slice(0, 500),
+    };
   }
 }
 
