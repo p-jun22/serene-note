@@ -25,7 +25,6 @@ if (!admin.apps.length) {
   }
 }
 
-// ✅ firestore 핸들 바로 꺼내서 함께 export
+// firestore 핸들 바로 꺼내서 함께 export
 const db = admin.firestore();
-module.exports = admin;
-module.exports.db = db;
+module.exports = { admin, db };

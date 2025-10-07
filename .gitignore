@@ -31,7 +31,7 @@ build/
 frontend/.env
 backend/.env
 backend/serviceAccountKey.json
-
+./fi
 # ------------------------
 # Python
 # ------------------------

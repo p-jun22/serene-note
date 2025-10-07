@@ -1,7 +1,7 @@
 // src/components/EmotionGraphPage.js
-// 날짜별 감정 분포 라인 그래프 (Chart.js + react-chartjs-2)
+// 날짜/월별 감정 분포 라인 그래프 (Chart.js + react-chartjs-2)
 // - 의존성: chart.js ^4, react-chartjs-2 ^5
-// - 백엔드 응답 스키마 자동 적응: 
+// - 백엔드 응답 스키마 자동 적응:
 //   A) [{ dateKey:"YYYY-MM-DD", emotions:["슬픔","불안", ...] }, ...]
 //   B) { "YYYY-MM-DD": { emotions:["..."], counts:{ "슬픔":2, ... } }, ... }
 
@@ -46,21 +46,42 @@ function ymdKST(dLike) {
 // KST 기준 N일 전
 function daysAgoKST(n) {
   const now = new Date();
-  // Date 자체는 UTC 보관이지만 출력은 ymdKST가 KST로 맞춰줌
   return ymdKST(new Date(now.getFullYear(), now.getMonth(), now.getDate() - n));
 }
 
+// 월 유틸
+function toFirstOfMonth(dateKeyOrDate) {
+  const d = dateKeyOrDate instanceof Date ? dateKeyOrDate : new Date(dateKeyOrDate);
+  return ymdKST(new Date(d.getFullYear(), d.getMonth(), 1));
+}
+function monthRangeOf(dateKey) {
+  const [y, m] = dateKey.split('-').map(Number);
+  const first = ymdKST(new Date(y, m - 1, 1));
+  const last = ymdKST(new Date(y, m, 0));
+  return { from: first, to: last, year: y, month: m };
+}
+
 export default function EmotionGraphPage() {
-  // 기본: 최근 7일(오늘 포함)
+  // 보기 모드: 'month' | 'range'
+  const [mode, setMode] = useState('month'); // 기본: 월별
+  // 월 피벗(첫날)
+  const [pivot, setPivot] = useState(toFirstOfMonth(new Date()));
+  const { from: mFrom, to: mTo, year, month } = useMemo(() => monthRangeOf(pivot), [pivot]);
+
+  // 기간 모드용
   const [from, setFrom] = useState(daysAgoKST(6));
   const [to, setTo] = useState(daysAgoKST(0));
 
-  const [rows, setRows] = useState([]); // 표준화된 [{dateKey, emotions:[]}]로 내부 처리
+  // 공통
+  const finalFrom = mode === 'month' ? mFrom : from;
+  const finalTo = mode === 'month' ? mTo : to;
+
+  const [rows, setRows] = useState([]); // 표준화된 [{dateKey, emotions:[]}]
   const [err, setErr] = useState('');
   const [loading, setLoading] = useState(false);
   const [authed, setAuthed] = useState(false);
 
-  // 로그인 상태 확인 후에만 로드 (401로 빈 데이터가 되는 문제 방지)
+  // 로그인 확인
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
       setAuthed(!!u);
@@ -92,7 +113,7 @@ export default function EmotionGraphPage() {
     if (obj) {
       for (const [dateKey, v] of Object.entries(obj)) {
         const emotions = Array.isArray(v?.emotions) ? v.emotions.filter(Boolean) : [];
-        // 혹시 counts만 있고 emotions 없으면, counts 키를 emotions로 펼침
+        // counts만 있고 emotions 없으면 counts 키를 emotions로 펼침
         if (!emotions.length && v?.counts && typeof v.counts === 'object') {
           const expanded = [];
           for (const [emo, n] of Object.entries(v.counts)) {
@@ -106,7 +127,6 @@ export default function EmotionGraphPage() {
       return out;
     }
 
-    // 그 외 스키마는 빈배열
     return [];
   }
 
@@ -115,7 +135,8 @@ export default function EmotionGraphPage() {
     try {
       setLoading(true);
       setErr('');
-      const res = await api.get(`/emotions`, { params: { from, to } });
+      // ⚠️ baseURL이 http://localhost:5000/api 라면 이 경로는 '/emotions'가 맞음
+      const res = await api.get('/emotions', { params: { from: finalFrom, to: finalTo } });
       setRows(normalizeResponse(res.data));
     } catch (e) {
       setErr(e?.response?.data?.error || e.message || '그래프 로드 오류');
@@ -125,11 +146,11 @@ export default function EmotionGraphPage() {
     }
   };
 
-  // 기간이 바뀔 때마다 로드
+  // 기간/월/로그인 바뀔 때마다 로드
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [from, to, authed]);
+  }, [finalFrom, finalTo, authed]);
 
   // rows -> 날짜별 감정 카운트 집계
   const { dates, uniqueEmotions, byDate } = useMemo(() => {
@@ -188,7 +209,10 @@ export default function EmotionGraphPage() {
       plugins: {
         title: {
           display: true,
-          text: '날짜별 감정 분포 (건수)',
+          text:
+            mode === 'month'
+              ? `날짜별 감정 분포 (건수) • ${year}년 ${month}월`
+              : '날짜별 감정 분포 (건수)',
           font: { size: 16, weight: 'bold' },
           color: '#3e3a36',
         },
@@ -223,35 +247,76 @@ export default function EmotionGraphPage() {
         },
       },
     }),
-    [],
+    [mode, year, month],
   );
+
+  // 월 전환
+  const goPrevMonth = () => {
+    const d = new Date(pivot);
+    setPivot(ymdKST(new Date(d.getFullYear(), d.getMonth() - 1, 1)));
+  };
+  const goNextMonth = () => {
+    const d = new Date(pivot);
+    setPivot(ymdKST(new Date(d.getFullYear(), d.getMonth() + 1, 1)));
+  };
 
   return (
     <div className="page" style={{ width: '100%', display: 'block' }}>
       <div className="toolbar">
         <div className="title">최근 감정 그래프</div>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          <button
+            className={`btn ${mode === 'month' ? 'primary' : ''}`}
+            onClick={() => setMode('month')}
+            aria-pressed={mode === 'month'}
+          >
+            월별
+          </button>
+          <button
+            className={`btn ${mode === 'range' ? 'primary' : ''}`}
+            onClick={() => setMode('range')}
+            aria-pressed={mode === 'range'}
+          >
+            기간
+          </button>
+        </div>
       </div>
 
-      <div style={{ margin: '12px 0', display: 'flex', gap: 8, alignItems: 'center' }}>
-        <input
-          type="date"
-          value={from}
-          max={to}
-          onChange={(e) => setFrom(e.target.value)}
-        />
-        <input
-          type="date"
-          value={to}
-          min={from}
-          onChange={(e) => setTo(e.target.value)}
-        />
-        <button className="btn" onClick={load} disabled={loading || !authed}>
-          {loading ? '불러오는 중…' : '새로고침'}
-        </button>
-        {err && <span style={{ color: 'crimson' }}>그래프 오류: {String(err)}</span>}
-        {!authed && <span className="muted">로그인 후 확인하세요.</span>}
-      </div>
+      {/* 컨트롤 영역 */}
+      {mode === 'month' ? (
+        <div style={{ margin: '12px 0', display: 'flex', gap: 8, alignItems: 'center' }}>
+          <button className="btn" onClick={goPrevMonth} aria-label="이전달">◀</button>
+          <div style={{ fontWeight: 600 }}>{year}년 {month}월</div>
+          <button className="btn" onClick={goNextMonth} aria-label="다음달">▶</button>
+          <button className="btn" onClick={load} disabled={loading || !authed}>
+            {loading ? '불러오는 중…' : '새로고침'}
+          </button>
+          {err && <span style={{ color: 'crimson' }}>그래프 오류: {String(err)}</span>}
+          {!authed && <span className="muted">로그인 후 확인하세요.</span>}
+        </div>
+      ) : (
+        <div style={{ margin: '12px 0', display: 'flex', gap: 8, alignItems: 'center' }}>
+          <input
+            type="date"
+            value={from}
+            max={to}
+            onChange={(e) => setFrom(e.target.value)}
+          />
+          <input
+            type="date"
+            value={to}
+            min={from}
+            onChange={(e) => setTo(e.target.value)}
+          />
+          <button className="btn" onClick={load} disabled={loading || !authed}>
+            {loading ? '불러오는 중…' : '새로고침'}
+          </button>
+          {err && <span style={{ color: 'crimson' }}>그래프 오류: {String(err)}</span>}
+          {!authed && <span className="muted">로그인 후 확인하세요.</span>}
+        </div>
+      )}
 
+      {/* 차트 */}
       <div style={{ width: '100%', height: 420 }}>
         {dates.length === 0 ? (
           <div

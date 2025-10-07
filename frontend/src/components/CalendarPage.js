@@ -1,5 +1,12 @@
+// src/components/CalendarPage.js
+// - App.css가 기대하는 레이아웃 클래스 적용:
+//   .page.page-calendar > .calendar-wrap > .toolbar + <Container />
+// - 날짜 클릭 시 즉시 onWrite(dateKey) 호출(모달/기록보기 없음: 최신 정책).
+// - /api/calendar 응답은 { data: { "YYYY-MM-DD": {...} } } 형태를 우선 사용하되
+//   일부 구버전/테스트 응답에 대응하기 위해 배열 -> 객체 매핑을 보강함.
+
 import React, { useEffect, useMemo, useState } from "react";
-import Calendar from "./Calendar";
+import Container from "./Container";
 import api from "../api";
 
 // YYYY-MM-DD (KST)
@@ -12,104 +19,77 @@ function ymdKST(date) {
   }).format(date);
 }
 
-function monthRange(dateLike) {
-  const d = new Date(dateLike);
-  const first = new Date(d.getFullYear(), d.getMonth(), 1);
-  const last = new Date(d.getFullYear(), d.getMonth() + 1, 0);
-  return { start: ymdKST(first), end: ymdKST(last) };
+// 기준 월의 1일~말일 범위를 KST로 산출
+function monthRangeKST(baseDate) {
+  const y = baseDate.getFullYear();
+  const m = baseDate.getMonth();
+  return { start: ymdKST(new Date(y, m, 1)), end: ymdKST(new Date(y, m + 1, 0)) };
 }
 
-export default function CalendarPage({ onWrite, onView }) {
-  const [baseDate, setBaseDate] = useState(new Date());
-  const [choice, setChoice] = useState(null); // { dateKey, exists }
-  const [marks, setMarks] = useState({});     // { dateKey: { emoji, count } }
-  const [err, setErr] = useState("");
+export default function CalendarPage({ onWrite }) {
+  const [current, setCurrent] = useState(() => new Date());
+  const [marks, setMarks] = useState({});
 
-  const { start, end } = useMemo(() => monthRange(baseDate), [baseDate]);
+  const year = current.getFullYear();
+  const month = current.getMonth() + 1;
+  const { start, end } = useMemo(() => monthRangeKST(current), [current]);
 
-  // 현재 달의 캘린더 마크 로드
+  const gotoPrev = () => { const d = new Date(current); d.setMonth(d.getMonth() - 1); setCurrent(d); };
+  const gotoNext = () => { const d = new Date(current); d.setMonth(d.getMonth() + 1); setCurrent(d); };
+  const gotoToday = () => setCurrent(new Date());
+
+  // 현재 월 범위의 캘린더 데이터 로드
   useEffect(() => {
+    let alive = true;
     (async () => {
       try {
-        setErr("");
-        const res = await api.get("/calendar", {
-          params: { startDateKey: start, endDateKey: end },
-        });
-        // 응답: { "YYYY-MM-DD": { count, topEmoji } }
-        const mapped = {};
-        Object.entries(res?.data || {}).forEach(([dateKey, v]) => {
-          mapped[dateKey] = {
-            emoji: v?.topEmoji || "",
-            count: typeof v?.count === "number" ? v.count : 0,
-          };
-        });
-        setMarks(mapped);
+        const res = await api.get("/calendar", { params: { startDateKey: start, endDateKey: end } });
+        // 우선 최신 스키마 { data: { dateKey: {...} } } 를 쓴다.
+        // 혹시 구버전/실험 응답이 배열이면 객체로 변환해 호환한다.
+        let data = res?.data?.data || res?.data || {};
+        if (Array.isArray(data)) {
+          const obj = {};
+          for (const row of data) {
+            const k = row?.dateKey || row?.date || null;
+            if (k) obj[k] = row;
+          }
+          data = obj;
+        }
+        if (alive) setMarks(data);
       } catch (e) {
-        setErr(e?.response?.data?.error || e.message || "캘린더 로드 오류");
-        setMarks({});
+        console.error("/api/calendar error:", e);
+        if (alive) setMarks({});
       }
     })();
+    return () => { alive = false; };
   }, [start, end]);
 
-  // 날짜 클릭 시
-  const handleSelect = async (dateKey) => {
-    try {
-      if ((marks?.[dateKey]?.count || 0) > 0) {
-        setChoice({ dateKey, exists: true });
-        return;
-      }
-      const res = await api.get(`/calendar/${dateKey}`);
-      setChoice({ dateKey, exists: !!res.data?.exists });
-    } catch {
-      setChoice({ dateKey, exists: false });
-    }
+  // 날짜 클릭 시: 최신 정책대로 바로 글쓰기(onWrite)로 진입
+  const handleSelect = (dateKey) => {
+    if (typeof onWrite === "function") onWrite(dateKey);
   };
 
   return (
     <div className="page page-calendar">
-      <h2 className="page-title">캘린더</h2>
-      {err && <div style={{ color: "crimson" }}>ERROR: {err}</div>}
-
       <div className="calendar-wrap">
-        <div className="calendar-card">
-          <Calendar
-            baseDate={baseDate}
-            onPrev={() =>
-              setBaseDate(new Date(baseDate.getFullYear(), baseDate.getMonth() - 1, 1))
-            }
-            onNext={() =>
-              setBaseDate(new Date(baseDate.getFullYear(), baseDate.getMonth() + 1, 1))
-            }
-            // ✅ 클릭 작동: onSelect로 전달 (onPick 아님)
-            onSelect={handleSelect}
-            // ✅ 날짜별 이모지/개수 표시
-            marks={marks}
-          />
-        </div>
-      </div>
-
-      {choice && (
-        <>
-          <div className="popup-backdrop" onClick={() => setChoice(null)} />
-          <div className="choice-modal">
-            <div className="panel" style={{ padding: "16px" }}>
-              <h3 style={{ marginBottom: 8 }}>{choice.dateKey}</h3>
-              <p style={{ marginBottom: 12 }}>
-                {choice.exists ? "이미 작성된 기록이 있습니다." : "아직 기록이 없습니다."}
-              </p>
-              <div className="choice-body">
-                <button className="btn" onClick={() => { onView?.(choice.dateKey); setChoice(null); }}>
-                  기록 보기
-                </button>
-                <button className="btn primary" onClick={() => { onWrite?.(choice.dateKey); setChoice(null); }}>
-                  일기 쓰기
-                </button>
-                <button className="btn" onClick={() => setChoice(null)}>닫기</button>
-              </div>
-            </div>
+        <div className="toolbar">
+          <div className="left">
+            <button className="btn" onClick={gotoPrev}>◀</button>
+            <span className="title">{year}-{String(month).padStart(2, "0")}</span>
           </div>
-        </>
-      )}
+          <div className="right">
+            <button className="btn" onClick={gotoNext}>▶</button>
+            <button className="btn" onClick={gotoToday}>오늘</button>
+          </div>
+        </div>
+
+        <Container
+          year={year}
+          month={month}
+          marks={marks}
+          onSelect={handleSelect}
+        />
+      </div>
     </div>
   );
 }

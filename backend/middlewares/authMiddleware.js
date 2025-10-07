@@ -1,20 +1,18 @@
-// backend/authMiddleware.js
-const admin = require('../firebaseAdmin');
+// backend/middlewares/authMiddleware.js
+const { admin } = require('../firebaseAdmin');
 
 async function authMiddleware(req, res, next) {
   try {
-    // 프론트 axios가 Bearer 토큰을 붙임 (쿠키 세션 아님)
-    // 프론트 코드: src/api.js 인터셉터 참고
     const auth = req.headers.authorization || '';
-    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-    if (!token) return res.status(401).json({ error: 'missing bearer token' });
+    const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : null;
+    if (!token) return res.status(401).json({ ok: false, error: 'missing_bearer_token' });
 
-    const decoded = await admin.auth().verifyIdToken(token);
-    req.user = { uid: decoded.uid };
-    return next();
+    const decoded = await admin.auth().verifyIdToken(token /*, true */);
+    req.user = { uid: decoded.uid, email: decoded.email || null, name: decoded.name || null };
+    next();
   } catch (e) {
-    console.error('authMiddleware error', e);
-    return res.status(401).json({ error: 'invalid token' });
+    console.error('authMiddleware error:', e?.code || e?.message || e);
+    return res.status(401).json({ ok: false, error: 'invalid_token' });
   }
 }
 
