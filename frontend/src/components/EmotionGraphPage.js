@@ -390,59 +390,71 @@ export default function EmotionGraphPage() {
         data: arr,
         borderColor: color,
         backgroundColor: color,
+        tension: 0.1,
         borderWidth: 2,
         pointRadius: 2,
-        tension: 0.3,
+        pointHoverRadius: 4,
         spanGaps: true,
       };
     });
     return { labels: dates, datasets };
   }, [dates, uniqueEmotions, byDate]);
 
-  const options = useMemo(
-    () => ({
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: true,     
-      spanGaps: false,
-      plugins: {
-        title: {
-          display: true,
-          text:
-            mode === 'month'
-              ? `날짜별 감정 분포 (건수) • ${year}년 ${month}월`
-              : '날짜별 감정 분포 (건수)',
-          font: { size: 16, weight: 'bold' },
-          color: '#3e3a36',
+const options = useMemo(
+  () => ({
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: true,
+    spanGaps: false,
+    plugins: {
+      title: {
+        display: true,
+        text:
+          mode === 'month'
+            ? `날짜별 감정 분포 (건수) • ${year}년 ${month}월`
+            : '날짜별 감정 분포 (건수)',
+        font: { size: 16, weight: 'bold' },
+        color: '#3e3a36',
+      },
+      legend: {
+        position: 'bottom',
+        labels: { boxWidth: 12, color: '#3e3a36', usePointStyle: true, pointStyle: 'line' },
+      },
+      tooltip: {
+        mode: 'index',
+        intersect: false,
+
+        // ⬇⬇ 추가: 0/빈값은 툴팁에서 숨김
+        filter: (item) => {
+          const v = item.parsed?.y ?? item.raw;
+          return v != null && !Number.isNaN(v) && v !== 0;
         },
-        legend: {
-          position: 'bottom',
-          labels: {
-            boxWidth: 12,
-            color: '#3e3a36',
-            usePointStyle: true,
-            pointStyle: 'line',
+
+        // (선택) 값이 있는 것만 라벨 표시
+        callbacks: {
+          label: (ctx) => {
+            const v = ctx.parsed?.y ?? ctx.raw;
+            if (!v) return null;                // 0/null 이면 표시 안 함
+            return `${ctx.dataset.label}: ${ctx.formattedValue}`;
           },
-        },
-        tooltip: {
-          mode: 'index',
-          intersect: false,
-          callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.formattedValue}` },
+          // (선택) 값 큰 순으로 정렬하고 싶으면 아래 주석 해제
+          itemSort: (a, b) => (b.parsed?.y ?? 0) - (a.parsed?.y ?? 0),
         },
       },
-      interaction: { mode: 'index', intersect: false },
-      scales: {
-        x: { ticks: { color: '#3e3a36' }, grid: { color: 'rgba(0,0,0,0.05)' } },
-        y: {
-          beginAtZero: true,
-          ticks: { precision: 0, color: '#3e3a36' },
-          grid: { color: 'rgba(0,0,0,0.08)' },
-          title: { display: true, text: '건수' },
-        },
+    },
+    interaction: { mode: 'index', intersect: false },
+    scales: {
+      x: { ticks: { color: '#3e3a36' }, grid: { color: 'rgba(0,0,0,0.05)' } },
+      y: {
+        beginAtZero: true,
+        ticks: { precision: 0, color: '#3e3a36' },
+        grid: { color: 'rgba(0,0,0,0.08)' },
+        title: { display: true, text: '건수' },
       },
-    }),
-    [mode, year, month],
-  );
+    },
+  }),
+  [mode, year, month],
+);
 
   // 월 이동
   const goPrevMonth = () => {

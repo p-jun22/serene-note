@@ -60,7 +60,9 @@ body {
     radial-gradient(1200px 600px at 80% -10%, var(--peach-100), transparent 60%),
     radial-gradient(1000px 500px at 10% 0%, var(--sand-50), transparent 60%),
     var(--peach-50);
+
 }
+
 
 /* =========================
    Header
@@ -161,7 +163,13 @@ body {
 .App {
   height: 100%;
   width: 100%;
+  overflow-y: auto;
+  scrollbar-width: none;
+  /* Firefox */
+  -ms-overflow-style: none;
+  /* IE/Edge */
 }
+
 .App main {
   height: auto;
   max-width: 1100px;
@@ -233,12 +241,12 @@ body {
 
 .calendar-wrap {
   width: 100%;
-  max-width: 760px;
+  max-width: 860px;
   margin: 0 auto;
 }
 
 .calendar {
-  --cell: 46px;
+  --cell: 60px;
   background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 0 0 var(--radius-lg) var(--radius-lg);
@@ -690,7 +698,7 @@ body {
   }
 }
 
-/* === 선택 모달 (기록 보기 / 일기 쓰기) === */
+/* === 선택 모달 (기록 보기 / 일기 쓰기) ===
 .choice-modal {
   position: fixed;
   left: 50%;
@@ -702,14 +710,14 @@ body {
   box-shadow: var(--shadow-2);
   width: 360px;
   max-width: 92vw;
-}
+} */
 
-.choice-body {
+/* .choice-body {
   display: flex;
   gap: 10px;
   padding: 12px;
   justify-content: flex-end;
-}
+} */
 
 
 
@@ -818,7 +826,13 @@ body {
 
 /* ===== Diary Archive (월간) ===== */
 .page-diary-archive {
+  align-items: normal;
   padding: 16px 0 24px;
+  overflow-y: auto;
+  scrollbar-width: none;
+  /* Firefox */
+  -ms-overflow-style: none;
+  /* IE/Edge */
 }
 
 .archive-container {
@@ -860,22 +874,24 @@ body {
   text-align: center;
 }
 
-/* 그리드: 데스크탑 2열, 모바일 1열 */
+/* 그리드: 데스크탑 4열, 모바일 2열 */
 .archive-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: flex;
+  flex-wrap: wrap;
+  grid-template-columns: repeat(4, minmax(0, 2fr));
   gap: 14px;
   padding: 8px 12px;
 }
 
 @media (max-width: 860px) {
   .archive-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: 2fr;
   }
 }
 
 /* 카드 */
 .archive-card {
+  box-sizing: border-box;
   background: #fff;
   border: 1px solid var(--line, #eee);
   border-radius: 14px;
@@ -894,8 +910,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 12px 14px;
+  gap: 10px;
+  padding: 12px 8px;
   background: #fff;
   border: 0;
   cursor: pointer;
@@ -919,7 +935,7 @@ body {
 .archive-card .card-head .right {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
 
 .archive-card .badge {
@@ -1553,6 +1569,7 @@ ul.diagnosis li.bad {
   gap: 6px;
   align-items: center;
 }
+
 .fb-btn {
   padding: 2px 8px;
   border: 1px solid #ddd;
@@ -1561,7 +1578,19 @@ ul.diagnosis li.bad {
   line-height: 1.6;
   background: #fff;
 }
-.fb-btn:hover { background: #f7f7f7; }
-.fb-btn.pos { border-color: #2ecc71; }
-.fb-btn.neg { border-color: #e74c3c; }
-.fb-steps .fb-btn { min-width: 28px; }
+
+.fb-btn:hover {
+  background: #f7f7f7;
+}
+
+.fb-btn.pos {
+  border-color: #2ecc71;
+}
+
+.fb-btn.neg {
+  border-color: #e74c3c;
+}
+
+.fb-steps .fb-btn {
+  min-width: 28px;
+}

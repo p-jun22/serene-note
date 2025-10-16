@@ -194,7 +194,7 @@ export default function DiaryListPage({ focusDate, onBack }) {
               const open = !!openKeys[dateKey];
               const details = dayDetails[dateKey];
 
-              // ✅ 공통 규칙: topEmoji → lastEmoji → moodLabels 추론, 없으면 표시 안 함
+              // 공통 규칙: topEmoji → lastEmoji → moodLabels 추론, 없으면 표시 안 함
               const dayEmoji = emojiFromSessionSummary(mark);
 
               return (
@@ -210,7 +210,7 @@ export default function DiaryListPage({ focusDate, onBack }) {
                     aria-controls={`day-body-${dateKey}`}
                   >
                     <div className="left">
-                      {/* ✅ 기존 CSS(.emoji) 유지, 내용만 공통 컴포넌트로 */}
+                      {/* 기존 CSS(.emoji) 유지, 내용만 공통 컴포넌트로 */}
                       <span className="emoji" aria-hidden>
                         <span className="emoji" aria-hidden>{mark?.emoji || mark?.topEmoji || mark?.lastEmoji || '📝'}</span>
                       </span>
