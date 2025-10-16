@@ -5,6 +5,7 @@
 // - HF 서버 호출은 백엔드가 한다. 프런트는 /api/* 만 호출한다.
 
 import axios from 'axios';
+import { onAuthStateChanged } from 'firebase/auth';
 import { auth } from './firebase';
 
 /** 백엔드 baseURL 추론 */
@@ -39,12 +40,20 @@ const api = axios.create({
 // 요청 인터셉터: Firebase ID 토큰 자동 첨부
 api.interceptors.request.use(async (config) => {
   const u = auth.currentUser;
+  config.headers = config.headers || {};
   if (u) {
     const token = await u.getIdToken();
-    config.headers = config.headers || {};
     config.headers.Authorization = `Bearer ${token}`;
+  } else {
+    delete config.headers.Authorization;
   }
   return config;
+});
+
+onAuthStateChanged(auth, (user) => {
+  if (!user && api.defaults.headers?.common?.Authorization) {
+    delete api.defaults.headers.common.Authorization;
+  }
 });
 
 // 응답 인터셉터: 401 → 토큰 갱신 후 1회 재시도
@@ -65,3 +74,22 @@ api.interceptors.response.use(
 );
 
 export default api;
+
+/* -----------------------------------------------------------
+ * 추가: 피드백 전송 래퍼 (관리자 0/1, 일반 1~5)
+ * - 컴포넌트에서 axios 직접 호출 금지 → 이 함수 사용
+ * - 서버 규약: POST /api/feedback
+ *   body = { messageId, dateKey, conversationId, ratings: { useful } }
+ * ----------------------------------------------------------- */
+export function postFeedback({ messageId, dateKey, conversationId, score }) {
+  if (!messageId || !dateKey || !conversationId) {
+    return Promise.reject(new Error('bad_params'));
+  }
+  return api.post('/feedback', {
+    messageId: String(messageId),
+    dateKey: String(dateKey),
+    conversationId: String(conversationId),
+    ratings: { useful: Number(score) }, // admin: 0|1, user: 1..5
+    // labels: { ... } // 추후 라벨 정정 붙일 때 확장
+  });
+}

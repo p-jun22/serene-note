@@ -4,6 +4,8 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import api from '../api';
+// 공통 이모지 컴포넌트/유틸 (추가)
+import Emoji, { emojiFromSessionSummary } from './emoji';
 
 function ymdKST(dLike) {
   const d = dLike instanceof Date ? dLike : new Date(dLike);
@@ -31,7 +33,7 @@ export default function DiaryListPage({ focusDate, onBack }) {
   const { from, to, year, month } = useMemo(() => monthRangeOf(pivot), [pivot]);
 
   // 캘린더 마크(해당 월의 작성 여부/이모지/대화 수)
-  const [marks, setMarks] = useState({}); // { dateKey: { count, topEmoji } }
+  const [marks, setMarks] = useState({}); // { dateKey: { count, topEmoji, lastEmoji, moodLabels, ... } }
   const [loading, setLoading] = useState(true);
 
   // 일자별 상세(첫 사용자 인풋 리스트 + title 병합)
@@ -192,6 +194,9 @@ export default function DiaryListPage({ focusDate, onBack }) {
               const open = !!openKeys[dateKey];
               const details = dayDetails[dateKey];
 
+              // ✅ 공통 규칙: topEmoji → lastEmoji → moodLabels 추론, 없으면 표시 안 함
+              const dayEmoji = emojiFromSessionSummary(mark);
+
               return (
                 <section
                   key={dateKey}
@@ -205,7 +210,10 @@ export default function DiaryListPage({ focusDate, onBack }) {
                     aria-controls={`day-body-${dateKey}`}
                   >
                     <div className="left">
-                      <span className="emoji" aria-hidden>{mark.topEmoji || '📝'}</span>
+                      {/* ✅ 기존 CSS(.emoji) 유지, 내용만 공통 컴포넌트로 */}
+                      <span className="emoji" aria-hidden>
+                        <span className="emoji" aria-hidden>{mark?.emoji || mark?.topEmoji || mark?.lastEmoji || '📝'}</span>
+                      </span>
                       <span className="date">{dateKey}</span>
                     </div>
                     <div className="right">

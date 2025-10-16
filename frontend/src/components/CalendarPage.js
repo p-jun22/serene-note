@@ -75,11 +75,11 @@ export default function CalendarPage({ onWrite }) {
         <div className="toolbar">
           <div className="left">
             <button className="btn" onClick={gotoPrev}>◀</button>
-            <span className="title">{year}-{String(month).padStart(2, "0")}</span>
+            <span className="title">{year} - {String(month).padStart(2, "0")}</span>
           </div>
           <div className="right">
             <button className="btn" onClick={gotoNext}>▶</button>
-            <button className="btn" onClick={gotoToday}>오늘</button>
+            <button className="btn" onClick={gotoToday}>이번 달</button>
           </div>
         </div>
 

@@ -31,7 +31,8 @@ build/
 frontend/.env
 backend/.env
 backend/serviceAccountKey.json
-./fi
+backend/_hf_local_store.json
+
 # ------------------------
 # Python
 # ------------------------
@@ -46,6 +47,15 @@ __pycache__/
 coverage/
 .tmp/
 *.local
-
+# ------------------------
 # tree
-tree.xtx
+# ------------------------
+tree.txt
+
+# ------------------------
+# Test / DB Scripts
+# ------------------------
+backend/tests/api.smoke.test.js
+backend/exportFirestoreCollection.js
+backend/users_full_tree.json
+

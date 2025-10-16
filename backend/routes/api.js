@@ -1,88 +1,105 @@
 // backend/routes/api.js
-// ─────────────────────────────────────────────────────────────
-// [역할 요약]
-// - 모든 /api/* 엔드포인트 총괄 (입력 검증 → 서비스/레포 호출)
-// - Firestore 직접 접근 금지(레포 사용). 단, 서버타임 상수는 라우터에서 patch에 주입 가능.
-// - Tree.txt 및 자가 경계 프롬프트 준수.
-//
-// [핵심 변경 요약(A/B)]
-// A) Seed 완전 제거: POST /conversations 가 "(대화 생성)" 메시지 만들지 않음(대화 문서만 생성)
-// B) 분석 파이프라인: /gpt/analyze 에 멱등성 + Stage-2(두 번째 user부터) 적용
-//    - clientMessageId 중복이면 기존 스냅샷 그대로 반환(재저장/재집계 없음)
-//    - countUserMessages >= 1 이면 enableStage2=true 로 gptService 호출
-//
-// [기타]
-// - assistant 메시지에는 analysisSnapshot_v1/hf_raw 저장 금지(정책 강제)
-// - assistant 저장도 correlationId 기반 멱등 처리
-// - 캘린더 범위/단일 조회는 repo.getCalendar()만 사용(루트 레거시 경로 폐기)
-// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// 레거시 제거 + 필드명 호환(dateKey|sessionId, text|content|message.text, cid|conversationId)
+// 더미(시드) 메시지 생성 없음
+// ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
 const axios = require('axios');
 const router = express.Router();
 
+router.use(express.json()); // body 파서
+
 const { authMiddleware } = require('../middlewares/authMiddleware');
-const { admin } = require('../firebaseAdmin'); // 서버타임 스탬프 주입용
+const { admin, db } = require('../firebaseAdmin');
 const repo = require('../services/firestoreRepository');
 const gpt = require('../services/gptService');
 
 const HF_BASE = process.env.HF_BASE_URL || process.env.HF_SERVER || 'http://127.0.0.1:5001';
+const ADMIN_EMAIL = 'admin@gmail.com';
+const BASELINE_EMAIL = 'basic@gmail.com';
 
-/* 공통 헬퍼 */
-function fail(res, code, error, detail) {
+const ymd = (s) => String(s || '').slice(0, 10);
+const fail = (res, code, error, detail) => {
   if (detail) console.error('[api]', error, detail);
   return res.status(code).json({ ok: false, error });
-}
-const ymd = (s) => String(s || '').slice(0, 10);
+};
 
-/* 라우터 접근 로깅(디버그) */
 router.use((req, _res, next) => {
   console.log('[api]', req.method, req.originalUrl);
   next();
 });
 
-/* ─────────────────────────────────────────────
-   1) Messages (assistant 전용 저장 + 목록/수정)
-───────────────────────────────────────────── */
+// ─────────────────────────────────────────────
+// 0) 헬스체크
+// ─────────────────────────────────────────────
+router.get('/health', (_req, res) => res.json({ ok: true, api: true }));
+
+router.get('/models/strength/health', authMiddleware, async (_req, res) => {
+  try {
+    const r = await axios.get(`${HF_BASE}/health`, { timeout: 5000 });
+    return res.json({ ok: true, hf: r.data?.ok === true });
+  } catch {
+    return res.json({ ok: true, hf: false });
+  }
+});
+
+// ─────────────────────────────────────────────
+// 1) Messages
+// ─────────────────────────────────────────────
 
 /**
  * POST /api/messages
- * - assistant 메시지만 저장 허용(분석 스냅샷/로짓 금지)
- * - correlationId(= 대응 user의 clientMessageId)로 멱등 보장
- * body: { sessionId, conversationId, message:{ role:'assistant', text, correlationId? } }
+ * body: { sessionId|dateKey, conversationId|cid, text|content|message.text, correlationId? }
+ * - assistant 메시지 저장 전용
+ * - text가 비어 있으면 저장을 건너뛰고 200 OK(skipped)로 응답
  */
 router.post('/messages', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
-    const { sessionId, conversationId, message } = req.body || {};
-    const role = String(message?.role || 'assistant');
-    const text = String(message?.text || '').trim();
-    const correlationId = message?.correlationId ? String(message.correlationId) : null;
 
-    if (!uid || !sessionId || !conversationId || !text) {
-      return fail(res, 400, 'bad_params');
-    }
-    if (role !== 'assistant') {
-      // user 메시지는 /gpt/analyze 로만 저장 (정책)
-      return fail(res, 400, 'use_gpt_analyze_for_user');
-    }
-    if (message.analysisSnapshot_v1 || message.hf_raw) {
-      return fail(res, 400, 'assistant_snapshot_forbidden');
+    // 필드명 호환 + message 래퍼 호환
+    const sessionIdRaw =
+      req.body?.sessionId ??
+      req.body?.dateKey ??
+      req.query?.sessionId ??
+      req.query?.dateKey;
+
+    const conversationId = String(
+      req.body?.conversationId ??
+      req.body?.cid ??
+      req.body?.message?.conversationId ??
+      ''
+    ).trim();
+
+    const rawText = req.body?.text ?? req.body?.content ?? req.body?.message?.text;
+    const text = (rawText == null ? '' : String(rawText)).trim();
+    const correlationId = req.body?.correlationId ? String(req.body.correlationId) : undefined;
+    const conversationTitle = req.body?.conversationTitle ?? null;
+
+    const sessionId = ymd(sessionIdRaw || '');
+    if (!uid || !sessionId || !conversationId) {
+      return fail(res, 400, 'bad_params', { uid: !!uid, sessionId, conversationId });
     }
 
-    // 멱등: 동일 correlationId 가 이미 저장되어 있으면 skip
-    if (correlationId) {
-      const dup = await repo.findAssistantByCorrelation({
-        uid, sessionId: ymd(sessionId), conversationId, correlationId
-      });
+    // 비어 있는 assistant 응답은 저장하지 않고 OK로 스킵 (프론트 전송 실패 방지)
+    if (!text) {
+      console.log('[api] /messages skipped: empty text');
+      return res.json({ ok: true, skipped: 'empty_text' });
+    }
+
+    // (옵션) 멱등: correlationId 중복 방지
+    if (correlationId && typeof repo.findAssistantByCorrelation === 'function') {
+      const dup = await repo.findAssistantByCorrelation({ uid, sessionId, conversationId, correlationId });
       if (dup) return res.json({ ok: true, dedup: true });
     }
 
     await repo.addMessage({
       uid,
-      sessionId: ymd(sessionId),
+      sessionId,
       conversationId,
-      message: { role: 'assistant', text, lastBot: true, correlationId }
+      conversationTitle,
+      message: { role: 'assistant', text, lastBot: true, correlationId },
     });
 
     return res.json({ ok: true });
@@ -93,15 +110,13 @@ router.post('/messages', authMiddleware, async (req, res) => {
 
 /**
  * GET /api/conversations/:conversationId/messages?sessionId=YYYY-MM-DD&limit=1000
- * - 특정 대화의 메시지 목록
  */
 router.get('/conversations/:conversationId/messages', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
     const conversationId = String(req.params.conversationId || '');
-    const sessionId = ymd(req.query.sessionId || '');
+    const sessionId = ymd(req.query.sessionId || req.query.dateKey || '');
     const limit = Number(req.query.limit || 1000);
-
     if (!uid || !sessionId || !conversationId) return fail(res, 400, 'bad_params');
 
     const rows = await repo.listMessages({ uid, sessionId, conversationId, limit });
@@ -113,47 +128,64 @@ router.get('/conversations/:conversationId/messages', authMiddleware, async (req
 
 /**
  * PATCH /api/messages/:messageId
- * - 사용자 메시지 텍스트 편집(간단 교체). 스냅샷 재분석은 별도 정책.
- * body: { sessionId, conversationId, text }
+ * body: { sessionId|dateKey, conversationId, text }
  */
 router.patch('/messages/:messageId', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
     const messageId = String(req.params.messageId || '');
-    const { sessionId, conversationId, text } = req.body || {};
+    const sessionId = ymd(req.body?.sessionId || req.body?.dateKey || '');
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const text = String(req.body?.text ?? '').trim();
 
     if (!uid || !sessionId || !conversationId || !messageId || typeof text !== 'string') {
-      return res.status(400).json({ ok:false, error:'bad_params' });
+      return fail(res, 400, 'bad_params');
     }
 
-    await repo.updateMessageText(
-      uid,
-      ymd(sessionId),
-      String(conversationId),
-      messageId,
-      String(text || '')
-    );
-
-    return res.json({ ok:true });
+    await repo.updateMessageText(uid, sessionId, conversationId, messageId, text);
+    return res.json({ ok: true });
   } catch (e) {
-    const code = e.code || 'server_error';
-    const http = (code === 'not_found') ? 404 : (code === 'forbidden' ? 403 : 500);
-    return res.status(http).json({ ok:false, error:code, message:e.message });
+    return fail(res, 500, 'message_update_failed', e);
   }
 });
 
-/* ─────────────────────────────────────────────
-   2) Conversations (목록/생성/수정/삭제)
-───────────────────────────────────────────── */
-
 /**
- * GET /api/conversations?sessionId=YYYY-MM-DD&limit=500
- * - 세션별 대화 목록
+ * POST /api/messages/:messageId/rate
+ * body: { sessionId|dateKey, conversationId, rating:number(0..5) }
  */
+router.post('/messages/:messageId/rate', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    const messageId = String(req.params.messageId || '');
+    const sessionId = ymd(req.body?.sessionId || req.body?.dateKey || '');
+    const conversationId = String(req.body?.conversationId || '').trim();
+    const rating = Number(req.body?.rating);
+
+    if (!uid || !sessionId || !conversationId || !messageId || Number.isNaN(rating)) {
+      return fail(res, 400, 'bad_params');
+    }
+
+    if (typeof repo.setUserRating === 'function') {
+      await repo.setUserRating({ uid, sessionId, conversationId, messageId, rating });
+    } else {
+      const ref = db.doc(`users/${uid}/sessions/${sessionId}/conversations/${conversationId}/messages/${messageId}`);
+      await ref.set({ userRating: rating }, { merge: true });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return fail(res, 500, 'message_rate_failed', err);
+  }
+});
+
+// ─────────────────────────────────────────────
+// 2) Conversations (목록/생성/수정/삭제) — 더미 메시지 없음
+// ─────────────────────────────────────────────
+
 router.get('/conversations', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
-    const sessionId = ymd(req.query.sessionId || '');
+    const sessionId = ymd(req.query.sessionId || req.query.dateKey || '');
     const limit = Number(req.query.limit || 500);
     if (!uid || !sessionId) return fail(res, 400, 'bad_params');
 
@@ -164,108 +196,120 @@ router.get('/conversations', authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * POST /api/conversations
- * - ★ Seed 금지: 대화 문서만 생성(메시지 생성하지 않음)
- * body: { sessionId, conversationId?, title? }
- */
+router.get('/conversations/:id', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    const sessionId = ymd(req.query.sessionId || req.query.dateKey || '');
+    const conversationId = String(req.params.id || '');
+    if (!uid || !sessionId || !conversationId) return fail(res, 400, 'bad_params');
+
+    const rows = await repo.listConversations({ uid, sessionId, limit: 1000 });
+    const one = rows.find((r) => r.id === conversationId) || null;
+    return res.json({ ok: true, data: one });
+  } catch (e) {
+    return fail(res, 500, 'get_conversation_failed', e);
+  }
+});
+
 router.post('/conversations', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
-    const { sessionId, conversationId, title } = req.body || {};
+    const sessionId = ymd(req.body?.sessionId || req.body?.dateKey || '');
+    const cid = String(req.body?.conversationId || require('crypto').randomUUID());
+    const title = String(req.body?.title || `${sessionId} 대화`);
+
     if (!uid || !sessionId) return fail(res, 400, 'bad_params');
 
-    const cid = conversationId || (require('crypto').randomUUID ?
-      require('crypto').randomUUID() :
-      Math.random().toString(36).slice(2) + Date.now().toString(36));
-
-    // 레포 함수(create)가 없다면 메타 set으로 문서만 보장(merge)
-    // createdAt은 서버시간으로 주입
-    await repo.updateConversationMeta({
-      uid,
-      dateKey: ymd(sessionId),
-      conversationId: cid,
-      patch: {
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const convRef = db.doc(`users/${uid}/sessions/${sessionId}/conversations/${cid}`);
+    await convRef.set(
+      {
         id: cid,
         uid,
-        dateKey: ymd(sessionId),
-        title: String(title || `${ymd(sessionId)} 대화`),
+        dateKey: sessionId,
+        title,
+        createdAt: now,
+        updatedAt: now,
         moodEmoji: null,
         moodLabels: [],
         distortions: [],
         coreBeliefs: [],
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      }
-    });
+        lastBotAt: null,
+        lastMsgAt: null,
+        msgCount: 0,
+        userMsgCount: 0,
+      },
+      { merge: true }
+    );
 
-    // 집계 갱신
-    await repo.recomputeCalendar({ uid, sessionId: ymd(sessionId) });
-
-    const items = await repo.listConversations({ uid, sessionId: ymd(sessionId), limit: 500 });
+    const items = await repo.listConversations({ uid, sessionId, limit: 500 });
     return res.json({ ok: true, id: cid, data: items });
   } catch (e) {
     return fail(res, 500, 'conversation_create_failed', e);
   }
 });
 
-/**
- * PUT /api/conversations/:conversationId
- * - 제목 변경(레포에서 집계까지 처리)
- */
 router.put('/conversations/:conversationId', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
     const conversationId = String(req.params.conversationId);
-    const { sessionId, title } = req.body || {};
+    const sessionId = ymd(req.body?.sessionId || req.body?.dateKey || '');
+    const title = String(req.body?.title || '').trim();
     if (!uid || !sessionId || !conversationId || !title) return fail(res, 400, 'bad_params');
 
-    await repo.updateConversationTitle({
-      uid,
-      sessionId: ymd(sessionId),
-      conversationId,
-      title: String(title).trim()
-    });
+    await repo.updateConversationTitle({ uid, sessionId, conversationId, title });
     return res.json({ ok: true });
   } catch (err) {
     return fail(res, 500, 'conversation_update_failed', err);
   }
 });
 
-/**
- * PATCH /api/conversations/:conversationId?sessionId=YYYY-MM-DD
- * - 메타/노트 등 소규모 패치
- */
 router.patch('/conversations/:conversationId', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
-    const { conversationId } = req.params;
-    const sessionId = ymd(req.query.sessionId || req.body?.sessionId || '');
+    const conversationId = String(req.params.conversationId);
+    const sessionId = ymd(
+      req.query.sessionId ||
+      req.query.dateKey ||
+      req.body?.sessionId ||
+      req.body?.dateKey ||
+      ''
+    );
     const { title, note } = req.body || {};
     if (!uid || !conversationId || !sessionId) return fail(res, 400, 'bad_params');
 
     if (typeof title === 'string' && title.trim()) {
-      await repo.updateConversationTitle({ uid, sessionId, conversationId, title: title.trim() });
+      await repo.updateConversationTitle({
+        uid,
+        sessionId,
+        conversationId,
+        title: String(title).trim(),
+      });
     }
+
     const patch = {};
     if (typeof note === 'string') patch.note = String(note).trim();
     if (Object.keys(patch).length) {
       await repo.updateConversationMeta({ uid, dateKey: sessionId, conversationId, patch });
     }
+
     return res.json({ ok: true });
   } catch (e) {
     return fail(res, 500, 'update_conversation_failed', e);
   }
 });
 
-/**
- * DELETE /api/conversations/:conversationId?sessionId=YYYY-MM-DD
- * - 대화+하위 메시지 일괄 삭제 + 집계 재계산
- */
 router.delete('/conversations/:conversationId', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
     const conversationId = String(req.params.conversationId);
-    const sessionId = ymd(req.query.sessionId || req.body?.sessionId || '');
+    const sessionId = ymd(
+      req.query.sessionId ||
+      req.query.dateKey ||
+      req.body?.sessionId ||
+      req.body?.dateKey ||
+      ''
+    );
     if (!uid || !sessionId || !conversationId) return fail(res, 400, 'bad_params');
 
     await repo.deleteConversationCascade({ uid, sessionId, conversationId });
@@ -275,19 +319,14 @@ router.delete('/conversations/:conversationId', authMiddleware, async (req, res)
   }
 });
 
-/* ─────────────────────────────────────────────
-   3) Calendar (범위/단일)
-───────────────────────────────────────────── */
-
-/**
- * GET /api/calendar?startDateKey=YYYY-MM-DD&endDateKey=YYYY-MM-DD
- * - sessions/{dateKey}/calendar/summary 만 조회
- */
+// ─────────────────────────────────────────────
+// 3) Calendar / Emotions / Day-first-inputs
+// ─────────────────────────────────────────────
 router.get('/calendar', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
-    const startDateKey = req.query.startDateKey ? ymd(req.query.startDateKey) : undefined;
-    const endDateKey   = req.query.endDateKey ? ymd(req.query.endDateKey)   : undefined;
+    const startDateKey = req.query.startDateKey ? ymd(req.query.startDateKey) : (req.query.from ? ymd(req.query.from) : undefined);
+    const endDateKey = req.query.endDateKey ? ymd(req.query.endDateKey) : (req.query.to ? ymd(req.query.to) : undefined);
     if (!uid) return fail(res, 400, 'bad_params');
 
     const data = await repo.getCalendar({ uid, startDateKey, endDateKey });
@@ -297,10 +336,6 @@ router.get('/calendar', authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * GET /api/calendar/:dateKey
- * - 단일 날짜 summary 1건 반환
- */
 router.get('/calendar/:dateKey', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
@@ -314,109 +349,242 @@ router.get('/calendar/:dateKey', authMiddleware, async (req, res) => {
   }
 });
 
-/* ─────────────────────────────────────────────
-   4) Models / Analysis
-───────────────────────────────────────────── */
+router.get('/emotions', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    const from = ymd(req.query.from);
+    const to = ymd(req.query.to);
+    if (!uid || !from || !to) return fail(res, 400, 'bad_params');
 
-/**
- * POST /api/gpt/analyze
- * - user 메시지 저장 + 분석 스냅샷 생성/반환
- * - 멱등성(clientMessageId) + Stage-2(두 번째 user부터) 적용
- * body: { sessionId, conversationId, text, clientMessageId? }
- */
+    const map = await repo.getCalendar({ uid, startDateKey: from, endDateKey: to });
+    const byDate = {};
+
+    for (const [k, v] of Object.entries(map)) {
+      const counts = v.moodCounters || {};
+      const expanded = [];
+      Object.entries(counts).forEach(([label, n]) => {
+        for (let i = 0; i < (n || 0); i++) expanded.push(label);
+      });
+      byDate[k] = {
+        emotions: expanded,
+        counts,
+        emoji: v.topEmoji || v.lastEmoji || v.emoji || null,
+        count: v.count || (v.convSet ? Object.keys(v.convSet).length : 0),
+      };
+    }
+
+    res.json({ ok: true, byDate, data: { byDate } });
+  } catch (e) {
+    return fail(res, 500, 'emotions_query_failed', e);
+  }
+});
+
+router.get('/days/:dateKey/first-user-inputs', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    const dateKey = ymd(req.params.dateKey);
+    if (!uid || !dateKey) return fail(res, 400, 'bad_params');
+
+    const convCol = db.collection(`users/${uid}/sessions/${dateKey}/conversations`);
+    const convSnap = await convCol.get();
+
+    const out = [];
+    const jobs = convSnap.docs.map(async (c) => {
+      const cid = c.id;
+      const msgCol = convCol.doc(cid).collection('messages');
+      const snap = await msgCol.orderBy('createdAt', 'asc').limit(20).get();
+
+      let first = null;
+      snap.forEach((m) => {
+        const v = m.data() || {};
+        if (!first && (v.role === 'user' || v.sender === 'user')) {
+          first = {
+            conversationId: cid,
+            firstUserText: v.text || v.content || '',
+            firstUserAt: v.createdAt || v.created_at || null,
+            firstMessageId: m.id,
+          };
+        }
+      });
+
+      if (first && (first.firstUserText || '').trim()) out.push(first);
+    });
+
+    await Promise.all(jobs);
+    res.json({ ok: true, data: out });
+  } catch (e) {
+    return fail(res, 500, 'first_user_inputs_failed', e);
+  }
+});
+
+// ─────────────────────────────────────────────
+// 4) Models / Analysis
+// ─────────────────────────────────────────────
 router.post('/gpt/analyze', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid || null;
-    const sessionId = ymd(req.body?.sessionId || req.body?.dateKey || '');
-    const conversationId = String(req.body?.conversationId || '').trim();
-    const clientMessageId = req.body?.clientMessageId ? String(req.body.clientMessageId) : null;
+    if (!uid) return res.status(401).json({ ok: false, error: 'unauthorized' });
+
+    const dateKey = ymd(req.body?.dateKey || req.body?.sessionId || '');
+    const conversationId = String(req.body?.conversationId || req.body?.cid || '').trim();
     const textRaw = (req.body?.text ?? req.body?.input ?? '');
     const text = String(textRaw).replace(/\s+/g, ' ').trim();
+    const clientMessageId = req.body?.clientMessageId ? String(req.body.clientMessageId) : null;
 
-    if (!uid) return res.status(401).json({ ok: false, error: 'unauthorized' });
-    if (!sessionId || !conversationId || !text) return fail(res, 400, 'bad_params');
+    if (!dateKey || !conversationId) return fail(res, 400, 'bad_params', { dateKey, conversationId });
+    if (!text) return res.status(400).json({ ok: false, error: 'text_required' });
 
-    // 1) 멱등성: 이미 같은 clientMessageId 로 저장된 user 메시지가 있으면 그대로 반환
-    if (clientMessageId) {
-      const dup = await repo.findUserMessageByClientKey({ uid, sessionId, conversationId, clientMessageId });
-      if (dup && dup.analysisSnapshot_v1) {
-        return res.json({ ok: true, messageId: dup.id, analysisSnapshot_v1: dup.analysisSnapshot_v1, hf_raw: dup.hf_raw ?? null, dedup: true });
+    // 멱등: clientMessageId 중복 시 기존 결과 반환
+    if (clientMessageId && typeof repo.findUserMessageByClientKey === 'function') {
+      const dup = await repo.findUserMessageByClientKey({
+        uid,
+        sessionId: dateKey,
+        conversationId,
+        clientMessageId,
+      });
+      if (dup) {
+        const msgRef = db.doc(`users/${uid}/sessions/${dateKey}/conversations/${conversationId}/messages/${dup.id}`);
+        const snap = await msgRef.get();
+        const data = snap.data() || {};
+        return res.json({
+          ok: true,
+          analysisSnapshot_v1: data.analysisSnapshot_v1 || null,
+          hf_raw: data.hf_raw || null,
+          dedup: true,
+        });
       }
     }
 
-    // 2) Stage-2 트리거: 해당 대화 user 메시지 개수가 1개 이상이면 이번 입력은 2번째 이상
-    const userCount = await repo.countUserMessages({ uid, sessionId, conversationId });
-    const enableStage2 = userCount >= 1;
+    const email = (req.user?.email || '').toLowerCase();
+    const isBaseline = email === BASELINE_EMAIL;
+    const isAdmin = !isBaseline && (email === ADMIN_EMAIL);
+    const isGeneral = !isBaseline && !isAdmin;
 
-    // 3) LLM/HF 분석 실행
-    const { snapshot, hf_raw } = await gpt.analyzeMessage({
+    let userCount = 0;
+    if (typeof repo.countUserMessages === 'function') {
+      userCount = await repo.countUserMessages({ uid, sessionId: dateKey, conversationId });
+    }
+
+    const enableCoaching = (!isBaseline) && (userCount >= 1);
+    const enableCorrection = (!isBaseline);
+    const mode = isBaseline ? 'baseline' : (isAdmin ? 'admin' : 'user');
+    const safetyOn = isGeneral;
+
+    const prevSnapshot =
+      (typeof repo.getLastUserSnapshot === 'function')
+        ? await repo.getLastUserSnapshot({ uid, sessionId: dateKey, conversationId })
+        : null;
+
+    const { snapshot, hf_raw, usedPrompts, suggestRetry } = await gpt.analyzeMessage({
       uid,
-      dateKey: sessionId,
+      dateKey,
       conversationId,
       userText: text,
-      enableStage2,
+      mode,
+      enableCoaching,
+      enableCorrection,
+      safetyOn,
+      prevSnapshot,
     });
 
-    // 4) user 메시지 1회 저장(+ 스냅샷/로짓) — 멱등성 키 연결
+    // 스냅샷/ HF 를 message 안에 넣어서 저장 (repo.addMessage는 message.*만 읽음)
     await repo.addMessage({
       uid,
-      sessionId,
+      sessionId: dateKey,
       conversationId,
-      message: {
-        role: 'user',
-        text,
-        analysisSnapshot_v1: snapshot,
-        hf_raw: hf_raw ?? null,
-        clientMessageId: clientMessageId || null,
-      }
+      message: { role: 'user', text, clientMessageId, analysisSnapshot_v1: snapshot, hf_raw },
     });
 
-    // 5) 결과 반환
-    return res.json({ ok: true, analysisSnapshot_v1: snapshot, hf_raw: hf_raw ?? null });
+    return res.json({
+      ok: true,
+      analysisSnapshot_v1: snapshot,
+      hf_raw: hf_raw ?? null,
+
+      // ⬇ 회귀 방지를 위해 상위 레벨도 유지
+      usedPrompts,
+      suggestRetry: !!suggestRetry,
+
+      // ⬇ 프런트 분기/분석용 메타
+      meta: {
+        pipeline: mode,               // 'baseline' | 'user' | 'admin'
+        coaching: enableCoaching,     // 두 번째 user 부터 true
+        correction: enableCorrection, // baseline이면 false, 그 외 true
+        isAdmin,                      // 디버깅/표시용(선택)
+        usedPrompts,                  // 중복 포함 OK
+        suggestRetry: !!suggestRetry,
+      },
+    });
   } catch (e) {
     console.error('[api] /gpt/analyze failed:', e);
-    return res.status(500).json({ ok: false, error: 'gpt_analyze_failed', message: e?.message || 'internal_error' });
+    return res.status(500).json({
+      ok: false,
+      error: 'gpt_analyze_failed',
+      message: e?.message || 'internal_error',
+    });
   }
 });
 
-/**
- * GET /api/models/session-analysis/:dateKey
- * - 세션 상세 분석(집계)
- */
-router.get('/models/session-analysis/:dateKey', authMiddleware, async (req, res) => {
+// ─────────────────────────────────────────────
+// 5) Calibration / Feedback
+// ─────────────────────────────────────────────
+router.get('/models/calibration/profile', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
-    const dateKey = ymd(req.params?.dateKey);
-    if (!uid || !dateKey) return fail(res, 400, 'bad_params');
+    if (!uid) return fail(res, 401, 'auth_required');
+    if (typeof repo.getCalibrationProfile !== 'function') return res.json({ ok: true, profile: null });
 
-    const data = await repo.getSessionDetailedAnalysis({ uid, dateKey });
-    return res.json({ ok: true, data });
-  } catch (err) {
-    return fail(res, 500, 'session_analysis_failed', err);
+    const profile = await repo.getCalibrationProfile(uid);
+    return res.json({ ok: true, profile });
+  } catch (e) {
+    return fail(res, 500, 'calibration_profile_failed', e);
   }
 });
 
-/**
- * HF 보조 서버 헬스/강점 분석(유지)
- */
-router.get('/models/strength/health', authMiddleware, async (_req, res) => {
+router.post('/models/calibration/profile', authMiddleware, async (req, res) => {
   try {
-    const r = await axios.get(`${HF_BASE}/health`, { timeout: 5000 });
-    return res.json({ ok: true, hf: r.data?.ok === true });
-  } catch (_e) {
-    return res.json({ ok: true, hf: false });
+    const email = (req.user?.email || '').toLowerCase();
+    const isAdmin = email === ADMIN_EMAIL;
+    if (!isAdmin) return fail(res, 403, 'forbidden');
+
+    const uid = req.user?.uid;
+    const profile = req.body?.profile;
+    if (!uid || !profile) return fail(res, 400, 'bad_params');
+    if (typeof repo.setCalibrationProfile !== 'function') return res.json({ ok: false, error: 'not_supported' });
+
+    await repo.setCalibrationProfile(uid, profile);
+    return res.json({ ok: true });
+  } catch (e) {
+    return fail(res, 500, 'calibration_profile_set_failed', e);
   }
 });
 
-router.post('/models/strength/analyze', authMiddleware, async (req, res) => {
+router.post('/feedback', authMiddleware, async (req, res) => {
   try {
-    const { input } = req.body || {};
-    if (!input || typeof input !== 'string') return fail(res, 400, 'bad_params');
-    const r = await axios.post(`${HF_BASE}/analyze-strength`, { input }, { timeout: 30000 });
-    return res.json(r.data);
-  } catch (err) {
-    const status = err?.response?.status || 500;
-    return res.status(status).json({ error: 'flask_call_failed', detail: err?.response?.data || null });
+    const uid = req.user?.uid;
+    const { messageId, ...payload } = req.body || {};
+    if (!uid || !messageId) return fail(res, 400, 'bad_params');
+
+    if (typeof repo.upsertFeedback !== 'function') {
+      return res.json({ ok: false, error: 'not_supported' });
+    }
+
+    const r = await repo.upsertFeedback(uid, String(messageId), payload);
+    return res.json({ ok: true, upserted: r.upserted, existed: r.existed });
+  } catch (e) {
+    return fail(res, 500, 'feedback_upsert_failed', e);
+  }
+});
+
+router.get('/feedback/count', authMiddleware, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    if (!uid) return fail(res, 401, 'auth_required');
+    if (typeof repo.countFeedbackSamples !== 'function') return res.json({ ok: true, count: 0 });
+
+    const { count } = await repo.countFeedbackSamples(uid);
+    return res.json({ ok: true, count });
+  } catch (e) {
+    return fail(res, 500, 'feedback_count_failed', e);
   }
 });
 

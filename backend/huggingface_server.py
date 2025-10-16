@@ -1,44 +1,91 @@
 # backend/huggingface_server.py
 # ─────────────────────────────────────────────────────────────────────────────
-# [역할]
-# - HF 서버(포트 5001): 제로샷 감정 분포, 핵심믿음 NLI, 요약 점수 계산
-# - /scores: gptService(백엔드 5000)가 호출하는 표준 엔드포인트
+# [역할/구성]
+# - Phase 1: /scores 에서 감정 확률·정규화 엔트로피·NLI(entail/contradict) 제공
+# - Phase 2: (gptService가 적용) 보정을 위한 HF 기준 신호 제공 (키 고정)
+# - Phase 3: 피드백 기반 Platt/Isotonic 학습/저장/평가
+#            /calibration/train, /calibration/profile, /eval/latest
+# - Phase 4: 경량 핫-리로드(/admin/reload)로 모델 아티팩트 교체
 #
-# [이번 보강]
-# 1) 기본 감정 라벨 통합(Plutchik + Ekman + 현행 유지 항목) 11종
-# 2) 동의어 매핑(모델 출력 정규화) 추가 → 제로샷 안정화
-# 3) 요청 본문 키 호환성: coreBelief | core_belief 모두 허용
-# 4) 구조/스키마/엔드포인트 변경 없음 (/scores 그대로, 응답에 hf_scores + hf_raw)
+# [키/스키마 고정 — gptService.js 기대치]
+# /scores 응답:
+# {
+#   "emotions_avg": number,
+#   "emotion_entropy": number,               # 0~1 정규화
+#   "nli_core": { "entail": number, "contradict": number },
+#   "hf_raw": {
+#     "emotion": { "avg": number, "entropy": number, "probs": {label: prob} },
+#     "nli_core": { "entail": number, "neutral": number, "contradict": number }
+#   }
+# }
 # ─────────────────────────────────────────────────────────────────────────────
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from transformers import pipeline
-import math
-import os
+import math, os, json, threading
+from datetime import datetime
+from typing import List, Dict, Tuple
+
+# ===== 의존 패키지 로드 =====
+try:
+    from transformers import pipeline
+except Exception as e:
+    raise RuntimeError("transformers 패키지가 필요합니다. pip install transformers") from e
+
+try:
+    from google.cloud import firestore  # 선택 의존
+    HAS_FIRESTORE = True
+except Exception:
+    HAS_FIRESTORE = False
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except Exception:
+    HAS_NUMPY = False
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
-# ===== 모델 로딩 =====
-# - 최초 호출 시 warm-up 지연 가능
-zero_shot = pipeline("zero-shot-classification", model="joeddav/xlm-roberta-large-xnli")
-nli_clf   = pipeline("text-classification",        model="joeddav/xlm-roberta-large-xnli")
+# ─────────────────────────────────────────────────────────────────────────────
+# 전역 상태 (모델 이름과 파이프라인 객체 분리)
+# ─────────────────────────────────────────────────────────────────────────────
+ZSL_MODEL_NAME = os.getenv("ZSL_MODEL", "joeddav/xlm-roberta-large-xnli")
+NLI_MODEL_NAME = os.getenv("NLI_MODEL", "joeddav/xlm-roberta-large-xnli")
 
-# ── 기본 감정 라벨(Plutchik + Ekman + 현행 유지 항목) ──
-# 기쁨, 신뢰, 두려움, 놀람, 슬픔, 혐오, 분노, 기대 + 수치심, 불안, 당혹
+zero_shot = None  # zero-shot-classification pipeline
+nli_clf   = None  # text-classification (XNLI) pipeline
+
+_reload_lock = threading.Lock()
+
+def load_pipelines(zsl_model_name: str, nli_model_name: str):
+    """주어진 모델 이름으로 파이프라인 생성."""
+    z = pipeline("zero-shot-classification", model=zsl_model_name)
+    n = pipeline("text-classification",      model=nli_model_name)
+    return z, n
+
+def load_models(zsl_name: str = None, nli_name: str = None):
+    """전역 파이프라인(zero_shot/nli_clf)과 모델명(ZSL_MODEL_NAME/NLI_MODEL_NAME)을 안전하게 갱신."""
+    global zero_shot, nli_clf, ZSL_MODEL_NAME, NLI_MODEL_NAME
+    if zsl_name: ZSL_MODEL_NAME = zsl_name
+    if nli_name: NLI_MODEL_NAME = nli_name
+    zero_shot, nli_clf = load_pipelines(ZSL_MODEL_NAME, NLI_MODEL_NAME)
+
+# 초기 모델 로드
+load_models()
+
+# 표준 감정 라벨(11)
 DEFAULT_EMOTION_LABELS = [
     "기쁨", "신뢰", "두려움", "놀람", "슬픔", "혐오", "분노", "기대",
     "수치심", "불안", "당혹"
 ]
 DEFAULT_POLARITY_LABELS = ["긍정", "부정"]
 
-# ── 동의어/표기 변형 정규화(제로샷 안정화) ──
-# - 모델/프롬프트/사용자 입력 변형을 표준 라벨로 모아준다.
+# 동의어 정규화 표
 EMOTION_SYNONYMS = {
     "기쁨": ["행복", "유쾌", "즐거움", "희열", "환희"],
     "신뢰": ["믿음", "안도"],
-    "두려움": ["공포", "겁", "두렴", "불안감"],
+    "두려움": ["공포", "겁", "불안감"],
     "놀람": ["경악", "깜짝"],
     "슬픔": ["우울", "상실감", "비애", "서글픔"],
     "혐오": ["역겨움", "반감"],
@@ -48,35 +95,230 @@ EMOTION_SYNONYMS = {
     "불안": ["초조", "걱정", "긴장"],
     "당혹": ["난처", "난감", "당황"],
 }
-
-# 역방향 매핑 테이블(한 번 생성해두고 사용)
-REVERSE_SYNONYM = {}
-for canonical, syns in EMOTION_SYNONYMS.items():
-    REVERSE_SYNONYM[canonical] = canonical
+REVERSE_SYNONYM = {k: k for k in EMOTION_SYNONYMS.keys()}
+for k, syns in EMOTION_SYNONYMS.items():
     for s in syns:
-        REVERSE_SYNONYM[s] = canonical
+        REVERSE_SYNONYM[s] = k
 
 def normalize_emotion(label: str) -> str:
-    """모델/입력 레이블을 표준 라벨로 정규화(없으면 원본 반환)."""
-    if not label:
-        return label
-    l = str(label).strip()
-    return REVERSE_SYNONYM.get(l, l)
+    if not label: return label
+    return REVERSE_SYNONYM.get(str(label).strip(), str(label).strip())
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Firestore or LocalStore 추상화
+# ─────────────────────────────────────────────────────────────────────────────
+class Store:
+    def __init__(self):
+        # 환경변수로 강제 선택 가능: HF_STORE_MODE=local|firestore
+        pref = (os.getenv("HF_STORE_MODE") or "").lower()
+        if pref in ("local", "firestore"):
+            self.mode = pref
+        else:
+            self.mode = "firestore" if HAS_FIRESTORE else "local"
+
+        if self.mode == "firestore":
+            try:
+                self.db = firestore.Client()  # ADC 없으면 여기서 예외
+            except Exception as e:
+                print("[HF][Store] Firestore ADC 미설정 → local 스토어로 폴백:", e)
+                self.mode = "local"
+
+        if self.mode == "local":
+            self.base = os.getenv("LOCAL_STORE", "./_hf_local_store.json")
+            if not os.path.exists(self.base):
+                with open(self.base, "w", encoding="utf-8") as f:
+                    json.dump({}, f, ensure_ascii=False, indent=2)
+
+    def _read_local(self):
+        with open(self.base, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _write_local(self, data):
+        with open(self.base, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def get_doc(self, path: str) -> dict:
+        if self.mode == "firestore":
+            ref = self.db.document(path)
+            snap = ref.get()
+            return snap.to_dict() or {}
+        data = self._read_local()
+        return data.get(path, {})
+
+    def set_doc(self, path: str, doc: dict, merge=True):
+        if self.mode == "firestore":
+            ref = self.db.document(path)
+            if merge: ref.set(doc, merge=True)
+            else: ref.set(doc)
+            return
+        data = self._read_local()
+        if merge and path in data and isinstance(data[path], dict):
+            cur = data[path]; cur.update(doc); data[path] = cur
+        else:
+            data[path] = doc
+        self._write_local(data)
+
+    def list_feedback(self, uid: str = None, date_from=None, date_to=None, limit=10000):
+        """피드백 표본 나열(학습용).
+        - local: users/*/feedback/* 전체 혹은 특정 uid만 스캔
+        - firestore: 특정 uid만 지원(전역 스캔은 배치 권장)
+        """
+        if self.mode == "firestore":
+            if not uid:
+                return []  # 전역 스캔은 운영 비용/권한 이슈로 생략
+            col = self.db.collection(f"users/{uid}/feedback")
+            docs = col.limit(limit).stream()
+            out = []
+            for d in docs:
+                row = d.to_dict() or {}
+                row["_id"] = d.id
+                row["_uid"] = uid
+                out.append(row)
+            return out
+
+        # local 모드
+        data = self._read_local()
+        out = []
+        if uid and uid != "*":
+            prefix = f"users/{uid}/feedback/"
+            for k, v in data.items():
+                if k.startswith(prefix):
+                    one = dict(v)
+                    one["_id"] = k.split(prefix, 1)[1]
+                    one["_uid"] = uid
+                    out.append(one)
+            return out
+
+        # uid=None 또는 uid="*": 모든 유저 스캔
+        for k, v in data.items():
+            if not k.startswith("users/"): continue
+            if "/feedback/" not in k: continue
+            parts = k.split("/")
+            # k = users/{uid}/feedback/{docId}
+            if len(parts) >= 4:
+                _uid = parts[1]
+                one = dict(v)
+                one["_id"] = parts[3]
+                one["_uid"] = _uid
+                out.append(one)
+        return out
+
+store = Store()
+
+def now_iso():
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 수치 유틸: 정규화 엔트로피, Platt, Isotonic, 메트릭
+# ─────────────────────────────────────────────────────────────────────────────
+def normalized_entropy_from_scores(scores: List[float]) -> float:
+    if not scores: return 0.0
+    s = sum(scores)
+    if s <= 0: return 0.0
+    probs = [max(1e-12, p / s) for p in scores]
+    ent = -sum([p * math.log(p) for p in probs])
+    max_ent = math.log(len(probs)) if len(probs) > 1 else 1.0
+    return float(ent / max_ent) if max_ent > 0 else 0.0
+
+def train_platt(ps: List[float], ys: List[int], lr=1.0, iters=200, l2=1e-4) -> Tuple[float, float]:
+    """간단 로지스틱 회귀(a,b): σ(a p + b)"""
+    a, b = 1.0, 0.0
+    for _ in range(iters):
+        grad_a = 0.0; grad_b = 0.0
+        hess_a = l2;  hess_b = l2
+        for p, y in zip(ps, ys):
+            x = max(0.0, min(1.0, float(p)))
+            z = a * x + b
+            s = 1.0 / (1.0 + math.exp(-z))
+            g = s - y
+            grad_a += g * x
+            grad_b += g
+            h = s * (1 - s)
+            hess_a += h * x * x
+            hess_b += h
+        if hess_a > 0: a -= lr * grad_a / hess_a
+        if hess_b > 0: b -= lr * grad_b / hess_b
+    return float(a), float(b)
+
+def apply_platt(p: float, a: float, b: float) -> float:
+    x = max(0.0, min(1.0, float(p)))
+    z = a * x + b
+    return 1.0 / (1.0 + math.exp(-z))
+
+def train_isotonic(ps: List[float], ys: List[int], bins=10) -> Tuple[List[float], List[float]]:
+    """간단 bin 기반 단조 맵(bins,map)."""
+    if not ps: return [0,1], [0.0]
+    edges = [i / bins for i in range(bins + 1)]
+    counts = [0]*bins; sums = [0.0]*bins
+    for p, y in zip(ps, ys):
+        x = max(0.0, min(1.0, float(p)))
+        idx = min(bins-1, int(x * bins))
+        counts[idx] += 1
+        sums[idx] += y
+    acc = [(sums[i]/counts[i]) if counts[i] > 0 else None for i in range(bins)]
+    last = 0.0
+    for i in range(bins):
+        if acc[i] is None:
+            acc[i] = last
+        last = acc[i]
+    for i in range(1, bins):
+        if acc[i] < acc[i-1]:
+            acc[i] = acc[i-1]
+    return edges, acc
+
+def apply_isotonic(p: float, edges: List[float], acc: List[float]) -> float:
+    x = max(0.0, min(1.0, float(p)))
+    lo, hi = 0, len(edges)-1
+    while lo + 1 < hi:
+        mid = (lo + hi) >> 1
+        if x < edges[mid]: hi = mid
+        else: lo = mid
+    return float(acc[lo]) if 0 <= lo < len(acc) else x
+
+def compute_metrics(ps: List[float], ys: List[int], bins=10) -> Dict[str,float]:
+    n = max(1, len(ps))
+    # ECE
+    edges = [i / bins for i in range(bins+1)]
+    ece = 0.0
+    for i in range(bins):
+        lo, hi = edges[i], edges[i+1]
+        bucket = [(p,y) for p,y in zip(ps,ys) if (i==bins-1 and p<=hi and p>=lo) or (p>=lo and p<hi)]
+        if not bucket: continue
+        conf = sum(p for p,_ in bucket)/len(bucket)
+        acc  = sum(1 if (p>=0.5) == (y==1) else 0 for p,y in bucket)/len(bucket)
+        ece += (len(bucket)/n) * abs(acc-conf)
+    # Brier
+    brier = sum((p - y)**2 for p,y in zip(ps,ys)) / n
+    # EM(=accuracy), F1
+    tp=fp=fn=tn=0
+    for p,y in zip(ps,ys):
+        pred = 1 if p>=0.5 else 0
+        if pred==1 and y==1: tp+=1
+        elif pred==1 and y==0: fp+=1
+        elif pred==0 and y==1: fn+=1
+        else: tn+=1
+    acc = (tp+tn)/n
+    f1 = (2*tp) / (2*tp + fp + fn) if (2*tp+fp+fn)>0 else 0.0
+    if HAS_NUMPY and len(set(ys))>1:
+        user_corr = float(np.corrcoef(np.array(ps), np.array(ys))[0,1])
+    else:
+        user_corr = 0.0
+    return {"ece": float(ece), "brier": float(brier), "em": float(acc), "f1": float(f1), "user_corr": user_corr}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 엔드포인트: 헬스/제로샷/NLI/점수
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "zsl_model": ZSL_MODEL_NAME, "nli_model": NLI_MODEL_NAME})
 
 @app.post("/zero-shot")
 def zero_shot_api():
     data = request.get_json(silent=True) or {}
     text = data.get("input", "")
     labels = data.get("labels") or DEFAULT_EMOTION_LABELS
-    if not text or not isinstance(labels, list) or len(labels) == 0:
+    if not text or not isinstance(labels, list) or len(labels)==0:
         return jsonify({"error": "input and labels are required"}), 400
-
-    # 표준 라벨/동의어도 모두 후보로 넣을 수 있지만,
-    # 기본은 표준 라벨만 후보로 두고 출력 후 정규화 단계를 거치는 편이 안정적임.
     out = zero_shot(text, candidate_labels=labels, multi_label=True)
     return jsonify({"labels": out["labels"], "scores": out["scores"]})
 
@@ -85,124 +327,268 @@ def nli_api():
     data = request.get_json(silent=True) or {}
     premise = data.get("premise", "")
     hypotheses = data.get("hypotheses", [])
-    if not premise or not isinstance(hypotheses, list) or len(hypotheses) == 0:
+    if not premise or not isinstance(hypotheses, list) or len(hypotheses)==0:
         return jsonify({"results": []})
-
     results = []
     for hyp in hypotheses:
         pair = premise + " </s></s> " + hyp
-        pred = nli_clf(pair, top_k=3)  # label: entailment/neutral/contradiction
+        pred = nli_clf(pair, top_k=3)
         label_map = {p["label"]: p["score"] for p in pred}
         results.append({
             "hypothesis": hyp,
-            "entail":     float(label_map.get("entailment",    0.0)),
-            "neutral":    float(label_map.get("neutral",       0.0)),
+            "entail": float(label_map.get("entailment", 0.0)),
+            "neutral": float(label_map.get("neutral", 0.0)),
             "contradict": float(label_map.get("contradiction", 0.0)),
         })
     return jsonify({"results": results})
 
-# ====== 점수 계산 엔드포인트 (/scores) ======
-# - gptService가 호출하는 표준 라우트 (B안 유지)
-# - 요청: { text, emotions?: string[], coreBelief?: string, core_belief?: string }
-# - 응답: { hf_scores: {...}, hf_raw: {...} }  ← 구조 변경 없음
 @app.post("/scores")
 def scores_api():
     data = request.get_json(silent=True) or {}
     text = str(data.get("text", "")).strip()
-    # 클라/백엔드 호환: coreBelief | core_belief 둘 다 수용
-    core_belief = str(data.get("coreBelief", data.get("core_belief", ""))).strip()
-
-    # LLM이 뽑아준 감정 라벨(선택) → 표준 라벨로 정규화
-    emotions_in = data.get("emotions") or []
-    if isinstance(emotions_in, list):
-        emotions_norm = [normalize_emotion(e) for e in emotions_in if isinstance(e, str)]
-    else:
-        emotions_norm = []
-
     if not text:
         return jsonify({"error": "text required"}), 400
+    core_belief = str(data.get("coreBelief", data.get("core_belief", ""))).strip()
+    emotions_in = data.get("emotions") or []
+    emotions_norm = [normalize_emotion(e) for e in emotions_in if isinstance(e, str)]
 
-    # 1) 감정 분포 (제로샷)
+    # 1) 감정 분포
     emo_out = zero_shot(text, candidate_labels=DEFAULT_EMOTION_LABELS, multi_label=True)
-    labels = emo_out["labels"]
-    scores = emo_out["scores"]
-    # 모델 출력 레이블도 동의어 정규화(혹시 모를 변형에 대비) → 표준 라벨 점수 딕셔너리
-    emo_dict = {}
+    labels = emo_out["labels"]; scores = [float(s) for s in emo_out["scores"]]
+    emo_probs = {}
     for lab, sc in zip(labels, scores):
         canon = normalize_emotion(lab)
-        emo_dict[canon] = float(sc)
+        emo_probs[canon] = max(sc, emo_probs.get(canon, 0.0))
 
-    # LLM이 선택한 감정의 평균 확률 (정규화된 표준 라벨 기준)
-    chosen = [emo_dict.get(lab, 0.0) for lab in emotions_norm]
-    emotions_avg = sum(chosen) / len(chosen) if len(chosen) > 0 else 0.0
+    chosen = [emo_probs.get(l, 0.0) for l in emotions_norm] if emotions_norm else []
+    emotions_avg = float(sum(chosen)/len(chosen)) if len(chosen)>0 else 0.0
+    emotion_entropy = normalized_entropy_from_scores(scores)
 
-    # 엔트로피 (base e): -sum p ln p
-    eps = 1e-12
-    entropy = -sum([p * math.log(p + eps) for p in scores])
-
-    # 2) 핵심믿음 NLI (있을 때만)
+    # 2) 핵심믿음 NLI
     nli_result = {"entail": 0.0, "neutral": 0.0, "contradict": 0.0}
     if core_belief:
         pair = text + " </s></s> " + core_belief
         pred = nli_clf(pair, top_k=3)
         label_map = {p["label"]: p["score"] for p in pred}
         nli_result = {
-            "entail":     float(label_map.get("entailment",    0.0)),
-            "neutral":    float(label_map.get("neutral",       0.0)),
+            "entail": float(label_map.get("entailment", 0.0)),
+            "neutral": float(label_map.get("neutral", 0.0)),
             "contradict": float(label_map.get("contradiction", 0.0)),
         }
 
-    resp = {
-        "hf_scores": {
-            "emotions_avg": emotions_avg,
-            "emotion_entropy": entropy,
-            "core_entail": nli_result["entail"],
-            "core_contradict": nli_result["contradict"],
-        },
+    return jsonify({
+        "emotions_avg": emotions_avg,
+        "emotion_entropy": emotion_entropy,
+        "nli_core": { "entail": nli_result["entail"], "contradict": nli_result["contradict"] },
         "hf_raw": {
-            "emotion": emo_dict,     # 표준 라벨 기준 확률 맵
+            "emotion": { "avg": emotions_avg, "entropy": emotion_entropy, "probs": emo_probs },
             "nli_core": nli_result
         }
-    }
-    return jsonify(resp)
+    })
 
-# ====== 간단 요약(강점/약점) – 기존 유지 ======
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3: 캘리브레이션 학습/저장/프로필/리포트
+# ─────────────────────────────────────────────────────────────────────────────
+# 학습 데이터 스키마(권장):
+# /users/{uid}/feedback/{messageId}:
+# {
+#   label: { emotions:[], distortions:[], coreBelief:"" },
+#   rating: number|null,              # 1~5
+#   model:  {
+#     p_emotions, p_distortions, p_coreBelief, p_final_raw,
+#     hf_entropy, hf_entail, hf_contradict
+#   },
+#   dateKey, is_baseline, ...
+# }
+#
+# 보정 파라미터:
+# /calibration/global { platt:{a,b}?, isotonic:{bins[], map[]}?, metrics{...} }
+# /users/{uid}/calibration/current { rated_samples, min_samples, platt?, isotonic?, metrics{...} }
+
+def _extract_training_pairs(feedback_rows: List[dict]) -> Tuple[List[float], List[int], Dict[str,float]]:
+    """p, y 추출. y는 rating>=4 → 1, else 0. p는 model.p_final_raw 우선."""
+    ps, ys = [], []
+    entropies = []
+    for r in feedback_rows:
+        m = r.get("model", {}) or {}
+        p = m.get("p_final_raw", None)
+        if p is None:
+            entropy = float(m.get("hf_entropy", 0.5))
+            entail  = float(m.get("hf_entail", 0.0))
+            contra  = float(m.get("hf_contradict", 0.0))
+            emotions = max(0.0, min(1.0, 1.0 - entropy))
+            core     = max(0.0, entail - contra)
+            distort  = 0.5
+            p = (emotions + core + distort) / 3.0
+        else:
+            p = float(p)
+        rating = r.get("rating", None)
+        if rating is not None:
+            y = 1 if float(rating) >= 4.0 else 0
+        else:
+            y = 0
+        ps.append(max(0.0, min(1.0, p)))
+        ys.append(int(y))
+        entropies.append(float(m.get("hf_entropy", 0.5)))
+    summary = {"entropy_avg": float(sum(entropies)/len(entropies)) if entropies else 0.0}
+    return ps, ys, summary
+
+def _save_calibration(scope: str, uid: str, platt_ab, iso_bins_map, metrics: dict, rated_samples: int, min_samples: int=20):
+    if scope == "global":
+        path = "calibration/global"
+        doc = {
+            "ver": now_iso(),
+            "sample_count": rated_samples,
+            "platt": {"a": platt_ab[0], "b": platt_ab[1]} if platt_ab else None,
+            "isotonic": {"bins": iso_bins_map[0], "map": iso_bins_map[1]} if iso_bins_map else None,
+            "metrics": metrics,
+            "updatedAt": now_iso()
+        }
+        store.set_doc(path, doc, merge=False)
+    else:
+        path = f"users/{uid}/calibration/current"
+        doc = {
+            "ver": now_iso(),
+            "rated_samples": rated_samples,
+            "min_samples": min_samples,
+            "platt": {"a": platt_ab[0], "b": platt_ab[1]} if platt_ab else None,
+            "isotonic": {"bins": iso_bins_map[0], "map": iso_bins_map[1]} if iso_bins_map else None,
+            "metrics": metrics,
+            "updatedAt": now_iso()
+        }
+        store.set_doc(path, doc, merge=False)
+
+def _save_eval_run(scope: str, uid: str, metrics: dict):
+    run_id = now_iso()
+    doc = {
+        "runId": run_id,
+        "scope": scope if scope=="global" else f"user:{uid}",
+        "sample_count": int(metrics.get("_n", 0)),
+        "metrics": {k: float(v) for k,v in metrics.items() if k != "_n"},
+        "updatedAt": now_iso()
+    }
+    store.set_doc(f"eval_runs/{run_id}", doc, merge=False)
+    return run_id
+
+@app.post("/calibration/train")
+def calibration_train():
+    data = request.get_json(silent=True) or {}
+    scope = data.get("scope", "global")  # "global" | "user"
+    uid = data.get("uid", None)
+    algo = data.get("algo", "both")      # "platt" | "isotonic" | "both"
+    min_samples = int(data.get("min_samples", 20))
+
+    if scope not in ("global","user"):
+        return jsonify({"error":"bad_scope"}), 400
+    if scope == "user" and not uid:
+        return jsonify({"error":"uid_required"}), 400
+
+    if scope == "user":
+        rows = store.list_feedback(uid=uid)
+    else:
+        # local: 모든 유저 스캔 / firestore: 전역 스캔 미지원
+        if store.mode == "local":
+            rows = store.list_feedback(uid="*")
+        else:
+            return jsonify({"error":"global_scan_not_supported_in_online_demo"}), 400
+
+    if not rows:
+        return jsonify({"error":"no_feedback_samples"}), 400
+
+    ps, ys, extra = _extract_training_pairs(rows)
+    n = len(ps)
+    if n < max(5, min_samples):
+        return jsonify({"error":"insufficient_samples", "found": n, "min_samples": min_samples}), 400
+
+    platt_ab = None
+    iso_bins_map = None
+    if algo in ("platt","both"):
+        platt_ab = train_platt(ps, ys)
+    if algo in ("isotonic","both"):
+        iso_bins_map = train_isotonic(ps, ys)
+
+    metrics = compute_metrics(ps, ys)
+    metrics["_n"] = n
+
+    _save_calibration(scope, uid or "", platt_ab, iso_bins_map, metrics, rated_samples=n, min_samples=min_samples)
+    run_id = _save_eval_run(scope, uid or "", metrics)
+
+    return jsonify({
+        "ok": True,
+        "scope": scope,
+        "uid": uid,
+        "algo": algo,
+        "trained": { "platt": bool(platt_ab), "isotonic": bool(iso_bins_map) },
+        "metrics": {k:v for k,v in metrics.items() if k!="_n"},
+        "extra": extra,
+        "eval_run_id": run_id
+    })
+
+@app.get("/calibration/profile")
+def calibration_profile():
+    uid = request.args.get("uid", None)
+    global_prof = store.get_doc("calibration/global") or {}
+    personal = store.get_doc(f"users/{uid}/calibration/current") if uid else {}
+    return jsonify({ "global": global_prof, "personal": personal })
+
+@app.get("/eval/latest")
+def eval_latest():
+    if store.mode == "local":
+        data = store._read_local()
+        items = [(k,v) for k,v in data.items() if k.startswith("eval_runs/")]
+        if not items: return jsonify({})
+        latest = sorted(items, key=lambda kv: kv[0], reverse=True)[0][1]
+        return jsonify(latest)
+    else:
+        return jsonify({})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4: 모델 핫-리로드(LoRA/Adapter 아티팩트 전환)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/admin/reload")
+def admin_reload():
+    global ZSL_MODEL_NAME, NLI_MODEL_NAME  # 참조 전에 global 선언 필수
+    data = request.get_json(silent=True) or {}
+    new_zsl = data.get("zsl_model") or ZSL_MODEL_NAME
+    new_nli = data.get("nli_model") or NLI_MODEL_NAME
+    with _reload_lock:
+        load_models(new_zsl, new_nli)
+    return jsonify({"ok": True, "zsl_model": ZSL_MODEL_NAME, "nli_model": NLI_MODEL_NAME})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 발표/요약 카드(참고)
+# ─────────────────────────────────────────────────────────────────────────────
 def _analyze_summary_logic(text: str):
     pol = zero_shot(text, candidate_labels=DEFAULT_POLARITY_LABELS, multi_label=False)
-    pol_label = pol["labels"][0]
-    pol_score = pol["scores"][0]
-
+    pol_label = pol["labels"][0]; pol_score = pol["scores"][0]
     emo = zero_shot(text, candidate_labels=DEFAULT_EMOTION_LABELS, multi_label=True)
     emo_pairs = sorted(zip(emo["labels"], emo["scores"]), key=lambda x: x[1], reverse=True)
-    emo_top = [f"{normalize_emotion(lab)}({score:.2f})" for lab, score in emo_pairs[:3]]
-
+    emo_top = [f"{normalize_emotion(l)}({s:.2f})" for l,s in emo_pairs[:3]]
     if pol_label == "긍정":
-        summary = f"전반적으로 **긍정적** 경향이 감지됩니다(신뢰도 {pol_score:.2f})."
+        summary = f"전반적으로 **긍정적** 경향(신뢰도 {pol_score:.2f}). "
     else:
-        summary = f"전반적으로 **부정적** 경향이 감지됩니다(신뢰도 {pol_score:.2f})."
-    summary += f" 주요 감정 후보: {', '.join(emo_top)}"
+        summary = f"전반적으로 **부정적** 경향(신뢰도 {pol_score:.2f}). "
+    summary += f"주요 감정 후보: {', '.join(emo_top)}"
     return summary
 
 @app.route("/api/analyze-strength", methods=["POST", "OPTIONS"])
 def analyze_strength_api():
-    if request.method == "OPTIONS":
-        return ("", 200)
+    if request.method == "OPTIONS": return ("", 200)
     data = request.get_json(silent=True) or {}
     text = data.get("input", "")
-    if not text:
-        return jsonify({"summary": "입력 텍스트가 없습니다."}), 400
+    if not text: return jsonify({"summary": "입력 텍스트가 없습니다."}), 400
     try:
-        summary = _analyze_summary_logic(text)
-        return jsonify({"summary": summary})
+        return jsonify({ "summary": _analyze_summary_logic(text) })
     except Exception as e:
-        print("analyze-strength error:", e)
-        return jsonify({"error": "internal_error", "detail": str(e)}), 500
+        return jsonify({"error":"internal_error","detail":str(e)}), 500
 
 @app.route("/analyze-strength", methods=["POST", "OPTIONS"])
 def analyze_strength_alias():
     return analyze_strength_api()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 엔트리포인트
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # 외부 바인딩 (LAN/터널/원격 백엔드에서 접근 가능)
     port = int(os.getenv("PORT", "5001"))
     app.run(host="0.0.0.0", port=port)

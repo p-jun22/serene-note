@@ -1,18 +1,20 @@
 // src/components/AccuracyAnalysis.js
 // ─────────────────────────────────────────────────────────────────────────────
 // [역할]
-// - 날짜 범위: 메시지 단위 확신도/보조지표를 날짜별 평균으로 시각화(기존 기능 유지)
-// - 진행(대화 순번) 분석: 선택한 날짜의 대화들을 생성순으로 정렬하여 1..N 순번에 따른 평균 지표 변화를 시각화(신규)
+// - 날짜 범위: 메시지 단위 확신도/보조지표를 날짜별 평균으로 시각화
+// - 진행(대화 순번): 선택 날짜의 대화들을 생성순으로 정렬한 뒤 1..N 순번에 따른 평균 지표 변화 시각화
 //
-// [주의]
-// - 쓰기/저장 없음(조회 전용). 엔드포인트/스키마 변경 없음.
+// [원칙]
+// - 조회 전용(쓰기 없음). 엔드포인트/스키마 변경 없음.
 // - LLM 확신도: snapshot.llm.confidences 우선, 없으면 snapshot.confidences 허용
-// - HF 지표: snapshot.hf.* 우선, 없으면 hf_raw.* fallback 허용
+// - HF 지표: snapshot.hf.* 우선, 없으면 m.hf_raw.* fallback 허용
+// - 발표용: HF를 메인으로 먼저 노출, 상태/커버리지 배지 제공, 콘솔 로그 제거
 // ─────────────────────────────────────────────────────────────────────────────
 
 import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api';
 
+/* ───── 날짜 유틸 ───── */
 function ymdKST(d) {
   if (!(d instanceof Date)) d = new Date(d);
   return new Intl.DateTimeFormat('en-CA', {
@@ -29,9 +31,10 @@ function rangeDays(startKey, endKey) {
 }
 function mean(arr) { const xs = (arr || []).filter(v => Number.isFinite(v)); return xs.length ? xs.reduce((a,b)=>a+b,0)/xs.length : null; }
 
+/* ───── 아주 가벼운 SVG 라인차트(의존성 X) ───── */
 function LineChart({ title, data, height = 160 }) {
   const padding = 32;
-  const width = Math.max(360, Math.min(900, (data?.length || 1) * 36));
+  const width = Math.max(360, Math.min(900, (data?.length || 1) * 42));
   const xs = data || [];
   const ys = xs.map(p => (p?.y ?? null)).filter(v => v !== null && Number.isFinite(v));
   const minY = ys.length ? Math.min(...ys) : 0;
@@ -81,47 +84,53 @@ function LineChart({ title, data, height = 160 }) {
   );
 }
 
+/* ───── 메인 컴포넌트 ───── */
 export default function AccuracyAnalysis() {
-  // ── 탭 상태: "date" | "progress"
+  // 탭: 'date' | 'progress'
   const [tab, setTab] = useState('date');
 
-  // ── 날짜 평균 탭 상태
+  // 날짜 평균 탭 상태
   const today = useMemo(() => ymdKST(new Date()), []);
   const defaultStart = useMemo(() => ymdKST(addDays(new Date(), -13)), []);
   const [startDate, setStartDate] = useState(defaultStart);
   const [endDate, setEndDate] = useState(today);
 
-  // ── 진행(대화 순번) 탭 상태 (기본: 종료일)
+  // 진행(대화 순번) 탭 상태
   const [focusDate, setFocusDate] = useState(endDate);
 
   const [loading, setLoading] = useState(false);
-  const [rows, setRows] = useState([]); // 날짜 평균 결과
+  const [rows, setRows] = useState([]);             // 날짜 평균 결과 [{dateKey, metrics:{...}}]
+  const [coverage, setCoverage] = useState({        // 날짜 평균 커버리지 배지
+    days: 0, userMsgs: 0, hfMsgs: 0
+  });
   const [progressRows, setProgressRows] = useState([]); // 순번 분석 결과
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // [A] 날짜 범위 평균 (기존 기능)
+  /* ──────────────────────────────────────────────────────────────────────────
+   * [A] 날짜 범위 평균
+   * ────────────────────────────────────────────────────────────────────────── */
   useEffect(() => {
     if (tab !== 'date') return;
     (async () => {
       setLoading(true);
       try {
-        // 1) 날짜 범위 캘린더 → convSet
+        // 1) 달력 → convSet
         const calRes = await api.get('/calendar', { params: { startDateKey: startDate, endDateKey: endDate } });
         const byDate = calRes?.data?.data || {};
         const dates = rangeDays(startDate, endDate);
         const out = [];
+        let msgSum = 0; let hfSum = 0;
 
         for (const dateKey of dates) {
           const convIds = Object.keys(byDate?.[dateKey]?.convSet || {});
           if (!convIds.length) { out.push({ dateKey, metrics: {} }); continue; }
 
-          // 2) 각 대화의 메시지(유저만) → 확신도/보조지표 수집
+          // 2) 각 대화 메시지(유저만) 수집 → 확신도/보조지표 평균
           const metrics = {
             llm_emotions: [], llm_distortions: [], llm_coreBelief: [], llm_question: [],
             hf_emotions_avg: [], hf_emotion_entropy: [], hf_core_entail: [], hf_core_contradict: []
           };
 
-          const allMsgs = await Promise.all(
+          const allMsgsPerConv = await Promise.all(
             convIds.map(cid =>
               api.get(`/conversations/${cid}/messages`, { params: { sessionId: dateKey, limit: 1000 } })
                 .then(r => r?.data?.data || [])
@@ -129,9 +138,10 @@ export default function AccuracyAnalysis() {
             )
           );
 
-          for (const msgs of allMsgs) {
+          for (const msgs of allMsgsPerConv) {
             for (const m of msgs) {
               if (m.role !== 'user') continue;
+              msgSum += 1;
 
               const snap = m?.analysisSnapshot_v1 || {};
               const llmConf = snap?.llm?.confidences || snap?.confidences || {};
@@ -140,37 +150,42 @@ export default function AccuracyAnalysis() {
               if (Number.isFinite(llmConf.coreBelief))  metrics.llm_coreBelief.push(llmConf.coreBelief);
               if (Number.isFinite(llmConf.question))    metrics.llm_question.push(llmConf.question);
 
+              let hasHF = false;
               const hfBlock = snap?.hf || null;
               if (hfBlock) {
                 const eavg = hfBlock?.emotion?.avg;
                 const entr = hfBlock?.emotion?.entropy;
                 const entl = hfBlock?.nli?.core?.entail;
                 const cont = hfBlock?.nli?.core?.contradict;
-                if (Number.isFinite(eavg)) metrics.hf_emotions_avg.push(eavg);
-                if (Number.isFinite(entr)) metrics.hf_emotion_entropy.push(entr);
-                if (Number.isFinite(entl)) metrics.hf_core_entail.push(entl);
-                if (Number.isFinite(cont)) metrics.hf_core_contradict.push(cont);
+                if (Number.isFinite(eavg)) { metrics.hf_emotions_avg.push(eavg); hasHF = true; }
+                if (Number.isFinite(entr)) { metrics.hf_emotion_entropy.push(entr); hasHF = true; }
+                if (Number.isFinite(entl)) { metrics.hf_core_entail.push(entl); hasHF = true; }
+                if (Number.isFinite(cont)) { metrics.hf_core_contradict.push(cont); hasHF = true; }
               } else {
                 const raw = m?.hf_raw || {};
                 const eavg = raw?.emotions_avg ?? raw?.emotion?.avg;
                 const entr = raw?.emotion_entropy ?? raw?.emotion?.entropy;
                 const entl = raw?.core_entail ?? raw?.nli_core?.entail ?? raw?.nli?.core?.entail;
                 const cont = raw?.core_contradict ?? raw?.nli_core?.contradict ?? raw?.nli?.core?.contradict;
-                if (Number.isFinite(eavg)) metrics.hf_emotions_avg.push(eavg);
-                if (Number.isFinite(entr)) metrics.hf_emotion_entropy.push(entr);
-                if (Number.isFinite(entl)) metrics.hf_core_entail.push(entl);
-                if (Number.isFinite(cont)) metrics.hf_core_contradict.push(cont);
+                if (Number.isFinite(eavg)) { metrics.hf_emotions_avg.push(eavg); hasHF = true; }
+                if (Number.isFinite(entr)) { metrics.hf_emotion_entropy.push(entr); hasHF = true; }
+                if (Number.isFinite(entl)) { metrics.hf_core_entail.push(entl); hasHF = true; }
+                if (Number.isFinite(cont)) { metrics.hf_core_contradict.push(cont); hasHF = true; }
               }
+              if (hasHF) hfSum += 1;
             }
           }
 
           const avg = Object.fromEntries(Object.entries(metrics).map(([k, arr]) => [k, mean(arr)]));
           out.push({ dateKey, metrics: avg });
         }
+
         setRows(out);
-      } catch (e) {
-        console.error('accuracy (by date) fetch failed:', e);
-        alert('정확도 분석(날짜) 데이터를 불러오지 못했어요.');
+        setCoverage({ days: dates.length, userMsgs: msgSum, hfMsgs: hfSum });
+      } catch {
+        alert('정확도 분석(날짜별 평균) 데이터를 불러오지 못했어요.');
+        setRows([]);
+        setCoverage({ days: 0, userMsgs: 0, hfMsgs: 0 });
       } finally {
         setLoading(false);
       }
@@ -181,19 +196,22 @@ export default function AccuracyAnalysis() {
     const xs = rows || [];
     const toSeries = (key) => xs.map(r => ({ x: r.dateKey, y: r.metrics?.[key] ?? null }));
     return {
-      llm_emotions: toSeries('llm_emotions'),
-      llm_distortions: toSeries('llm_distortions'),
-      llm_coreBelief: toSeries('llm_coreBelief'),
-      llm_question: toSeries('llm_question'),
+      // HF 먼저(메인)
       hf_emotions_avg: toSeries('hf_emotions_avg'),
       hf_emotion_entropy: toSeries('hf_emotion_entropy'),
       hf_core_entail: toSeries('hf_core_entail'),
       hf_core_contradict: toSeries('hf_core_contradict'),
+      // LLM 나중
+      llm_emotions: toSeries('llm_emotions'),
+      llm_distortions: toSeries('llm_distortions'),
+      llm_coreBelief: toSeries('llm_coreBelief'),
+      llm_question: toSeries('llm_question'),
     };
   }, [rows]);
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // [B] 진행(대화 순번) 분석
+  /* ──────────────────────────────────────────────────────────────────────────
+   * [B] 진행(대화 순번) 분석
+   * ────────────────────────────────────────────────────────────────────────── */
   useEffect(() => {
     if (tab !== 'progress') return;
     (async () => {
@@ -208,9 +226,9 @@ export default function AccuracyAnalysis() {
         // 2) 각 대화의 createdAt 기준으로 정렬(1..N 순번)
         const convMetas = await Promise.all(
           convIds.map(async (cid) => {
-            const conv = await api.get(`/conversations/${cid}`, { params: { sessionId: focusDate } }).then(r => r?.data?.data || null).catch(()=>null);
-            // conv가 없더라도 메시지에서 보완 가능
-            return { id: cid, createdAt: conv?.createdAt?._seconds || 0, meta: conv };
+            const conv = await api.get(`/conversations/${cid}`, { params: { sessionId: focusDate } })
+              .then(r => r?.data?.data || null).catch(()=>null);
+            return { id: cid, createdAt: conv?.createdAt?._seconds || 0 };
           })
         );
         convMetas.sort((a,b)=> (a.createdAt||0) - (b.createdAt||0));
@@ -265,9 +283,9 @@ export default function AccuracyAnalysis() {
         }
 
         setProgressRows(seqMetrics);
-      } catch (e) {
-        console.error('accuracy (progress) fetch failed:', e);
+      } catch {
         alert('정확도 분석(진행) 데이터를 불러오지 못했어요.');
+        setProgressRows([]);
       } finally {
         setLoading(false);
       }
@@ -278,41 +296,47 @@ export default function AccuracyAnalysis() {
     const xs = progressRows || [];
     const toSeries = (key) => xs.map(r => ({ x: String(r.idx), y: r.metrics?.[key] ?? null }));
     return {
-      llm_emotions: toSeries('llm_emotions'),
-      llm_distortions: toSeries('llm_distortions'),
-      llm_coreBelief: toSeries('llm_coreBelief'),
-      llm_question: toSeries('llm_question'),
+      // HF 먼저
       hf_emotions_avg: toSeries('hf_emotions_avg'),
       hf_emotion_entropy: toSeries('hf_emotion_entropy'),
       hf_core_entail: toSeries('hf_core_entail'),
       hf_core_contradict: toSeries('hf_core_contradict'),
+      // LLM 나중
+      llm_emotions: toSeries('llm_emotions'),
+      llm_distortions: toSeries('llm_distortions'),
+      llm_coreBelief: toSeries('llm_coreBelief'),
+      llm_question: toSeries('llm_question'),
     };
   }, [progressRows]);
 
-  // ───────────────────────────────────────────────────────────────────────────
+  /* ───── 렌더 ───── */
   return (
     <div className="page-wrap" style={{ padding: 16 }}>
-      {/* 탭 스위처 */}
+      {/* 탭 / 컨트롤 */}
       <div className="toolbar" style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
         <div style={{ fontWeight: 700, fontSize: 18 }}>정확도 분석</div>
         <div style={{ display: 'flex', gap: 6, marginLeft: 8 }}>
-          <button className={`btn ${tab==='date'?'btn-primary':''}`} onClick={()=>setTab('date')}>날짜별 평균</button>
-          <button className={`btn ${tab==='progress'?'btn-primary':''}`} onClick={()=>setTab('progress')}>진행(대화 순번)</button>
+          <button className={`btn ${tab==='date'?'primary':''}`} onClick={()=>setTab('date')}>날짜별 평균</button>
+          <button className={`btn ${tab==='progress'?'primary':''}`} onClick={()=>setTab('progress')}>진행(대화 순번)</button>
         </div>
         <div style={{ flex: 1 }} />
 
         {tab === 'date' && (
           <>
-            <label style={{ fontSize: 12 }}>시작</label>
+            <label className="muted" style={{ fontSize: 12 }}>시작</label>
             <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
-            <label style={{ fontSize: 12 }}>종료</label>
+            <label className="muted" style={{ fontSize: 12 }}>종료</label>
             <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+            <span className={`chip ${coverage.hfMsgs>0?'good':'warn'}`} title="HF 지표가 있는 유저 메시지 수 / 전체 유저 메시지 수">
+              HF 커버리지: {coverage.hfMsgs}/{coverage.userMsgs}
+            </span>
+            <span className="chip" title="선택된 날짜 수">일수: {coverage.days}</span>
           </>
         )}
 
         {tab === 'progress' && (
           <>
-            <label style={{ fontSize: 12 }}>분석 날짜</label>
+            <label className="muted" style={{ fontSize: 12 }}>분석 날짜</label>
             <input type="date" value={focusDate} onChange={(e) => setFocusDate(e.target.value)} />
           </>
         )}
@@ -322,27 +346,33 @@ export default function AccuracyAnalysis() {
 
       {!loading && tab === 'date' && (
         <>
-          <LineChart title="LLM: 감정 확신도 (날짜별 평균)" data={series.llm_emotions} />
-          <LineChart title="LLM: 인지왜곡 확신도 (날짜별 평균)" data={series.llm_distortions} />
-          <LineChart title="LLM: 핵심믿음 확신도 (날짜별 평균)" data={series.llm_coreBelief} />
-          <LineChart title="LLM: 질문 적합도 (날짜별 평균)" data={series.llm_question} />
+          {/* HF 먼저(메인) */}
           <LineChart title="HF: emotions_avg (날짜별 평균)" data={series.hf_emotions_avg} />
           <LineChart title="HF: emotion_entropy (날짜별 평균)" data={series.hf_emotion_entropy} />
           <LineChart title="HF: core_entail (날짜별 평균)" data={series.hf_core_entail} />
           <LineChart title="HF: core_contradict (날짜별 평균)" data={series.hf_core_contradict} />
+
+          {/* LLM 다음 */}
+          <LineChart title="LLM: 감정 확신도 (날짜별 평균)" data={series.llm_emotions} />
+          <LineChart title="LLM: 인지왜곡 확신도 (날짜별 평균)" data={series.llm_distortions} />
+          <LineChart title="LLM: 핵심믿음 확신도 (날짜별 평균)" data={series.llm_coreBelief} />
+          <LineChart title="LLM: 질문 적합도 (날짜별 평균)" data={series.llm_question} />
         </>
       )}
 
       {!loading && tab === 'progress' && (
         <>
-          <LineChart title="LLM: 감정 확신도 (대화 순번)" data={progressSeries.llm_emotions} />
-          <LineChart title="LLM: 인지왜곡 확신도 (대화 순번)" data={progressSeries.llm_distortions} />
-          <LineChart title="LLM: 핵심믿음 확신도 (대화 순번)" data={progressSeries.llm_coreBelief} />
-          <LineChart title="LLM: 질문 적합도 (대화 순번)" data={progressSeries.llm_question} />
+          {/* HF 먼저(메인) */}
           <LineChart title="HF: emotions_avg (대화 순번)" data={progressSeries.hf_emotions_avg} />
           <LineChart title="HF: emotion_entropy (대화 순번)" data={progressSeries.hf_emotion_entropy} />
           <LineChart title="HF: core_entail (대화 순번)" data={progressSeries.hf_core_entail} />
           <LineChart title="HF: core_contradict (대화 순번)" data={progressSeries.hf_core_contradict} />
+
+          {/* LLM 다음 */}
+          <LineChart title="LLM: 감정 확신도 (대화 순번)" data={progressSeries.llm_emotions} />
+          <LineChart title="LLM: 인지왜곡 확신도 (대화 순번)" data={progressSeries.llm_distortions} />
+          <LineChart title="LLM: 핵심믿음 확신도 (대화 순번)" data={progressSeries.llm_coreBelief} />
+          <LineChart title="LLM: 질문 적합도 (대화 순번)" data={progressSeries.llm_question} />
         </>
       )}
     </div>

@@ -157,7 +157,13 @@ body {
 /* =========================
    Page wrapper
    ========================= */
+
+.App {
+  height: 100%;
+  width: 100%;
+}
 .App main {
+  height: auto;
   max-width: 1100px;
   margin: 16px auto 32px;
   padding: 0 16px;
@@ -213,7 +219,9 @@ body {
 
 .toolbar .title {
   font-weight: 800;
+  font-size: large;
   color: var(--clay-700);
+  padding: 0 230px 0 270px;
 }
 
 /* =========================
@@ -1537,3 +1545,23 @@ ul.diagnosis li.bad {
 .msg.user {
   align-items: flex-end;
 }
+
+/* 피드백 바 */
+.feedback-bar {
+  margin-top: 6px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.fb-btn {
+  padding: 2px 8px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  background: #fff;
+}
+.fb-btn:hover { background: #f7f7f7; }
+.fb-btn.pos { border-color: #2ecc71; }
+.fb-btn.neg { border-color: #e74c3c; }
+.fb-steps .fb-btn { min-width: 28px; }
