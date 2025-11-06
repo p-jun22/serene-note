@@ -24,6 +24,31 @@
         { "fieldPath": "dateKey", "order": "ASCENDING" },
         { "fieldPath": "uid", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "messages",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        {"fieldPath":"role","order":"ASCENDING"},
+        {"fieldPath":"createdAt","order":"ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "messages",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        {"fieldPath":"uid","order":"ASCENDING"},
+        {"fieldPath":"createdAt","order":"ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "messages",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        {"fieldPath":"role","order":"ASCENDING"},
+        {"fieldPath":"uid","order":"ASCENDING"},
+        {"fieldPath":"createdAt","order":"ASCENDING"}
+      ]
     }
   ],
   "fieldOverrides": []

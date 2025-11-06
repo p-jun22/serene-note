@@ -1,5 +1,5 @@
 # backend/huggingface_server.py
-# ─────────────────────────────────────────────────────────────────────────────
+# ===============================================================================
 # [역할/구성]
 # - Phase 1: /scores 에서 감정 확률·정규화 엔트로피·NLI(entail/contradict) 제공
 # - Phase 2: (gptService가 적용) 보정을 위한 HF 기준 신호 제공 (키 고정)
@@ -18,13 +18,32 @@
 #     "nli_core": { "entail": number, "neutral": number, "contradict": number }
 #   }
 # }
-# ─────────────────────────────────────────────────────────────────────────────
+# ===============================================================================
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import math, os, json, threading
-from datetime import datetime
 from typing import List, Dict, Tuple
+from datetime import datetime
+import math, os, json, threading
+import re
+
+
+try:
+    import torch
+    HAS_TORCH = True
+except Exception:
+    HAS_TORCH = False
+
+EMOTION_TEMPLATE = os.getenv("HF_EMO_TEMPLATE", "이 문장은 {} 감정을 표현한다.")
+HF_BATCH = int(os.getenv("HF_BATCH", "8"))
+
+DEVICE = -1
+FP16 = False
+if HAS_TORCH and torch.cuda.is_available():
+    DEVICE = int(os.getenv("HF_DEVICE", "0"))
+    FP16 = os.getenv("HF_FP16", "1") == "1"
+
+
 
 # ===== 의존 패키지 로드 =====
 try:
@@ -47,9 +66,10 @@ except Exception:
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===============================================================================
 # 전역 상태 (모델 이름과 파이프라인 객체 분리)
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ===============================================================================
 ZSL_MODEL_NAME = os.getenv("ZSL_MODEL", "joeddav/xlm-roberta-large-xnli")
 NLI_MODEL_NAME = os.getenv("NLI_MODEL", "joeddav/xlm-roberta-large-xnli")
 
@@ -59,9 +79,13 @@ nli_clf   = None  # text-classification (XNLI) pipeline
 _reload_lock = threading.Lock()
 
 def load_pipelines(zsl_model_name: str, nli_model_name: str):
-    """주어진 모델 이름으로 파이프라인 생성."""
-    z = pipeline("zero-shot-classification", model=zsl_model_name)
-    n = pipeline("text-classification",      model=nli_model_name)
+    kw = {}
+    if DEVICE >= 0:
+        kw["device"] = DEVICE
+        if FP16:
+            kw["torch_dtype"] = torch.float16
+    z = pipeline("zero-shot-classification", model=zsl_model_name, **kw)
+    n = pipeline("text-classification",      model=nli_model_name, **kw)
     return z, n
 
 def load_models(zsl_name: str = None, nli_name: str = None):
@@ -81,20 +105,31 @@ DEFAULT_EMOTION_LABELS = [
 ]
 DEFAULT_POLARITY_LABELS = ["긍정", "부정"]
 
-# 동의어 정규화 표
+# --- 동의어 정규화 기본표
 EMOTION_SYNONYMS = {
-    "기쁨": ["행복", "유쾌", "즐거움", "희열", "환희"],
-    "신뢰": ["믿음", "안도"],
-    "두려움": ["공포", "겁", "불안감"],
-    "놀람": ["경악", "깜짝"],
-    "슬픔": ["우울", "상실감", "비애", "서글픔"],
-    "혐오": ["역겨움", "반감"],
-    "분노": ["화남", "화", "짜증", "격노", "분개"],
-    "기대": ["희망", "기대감"],
-    "수치심": ["부끄러움", "창피", "면목없음"],
-    "불안": ["초조", "걱정", "긴장"],
-    "당혹": ["난처", "난감", "당황"],
+    "기쁨": ["행복","유쾌","즐거움","희열","환희"],
+    "신뢰": ["믿음","안도"],
+    "두려움": ["공포","겁","불안감"],
+    "놀람": ["경악","깜짝"],
+    "슬픔": ["우울","상실감","비애","서글픔"],
+    "혐오": ["역겨움","반감"],
+    "분노": ["화남","화","짜증","격노","분개"],
+    "기대": ["희망","기대감"],
+    "수치심": ["부끄러움","창피","면목없음"],
+    "불안": ["초조","걱정","긴장"],
+    "당혹": ["난처","난감","당황"],
 }
+# 확장 동의어(LLM 출력 흡수)
+EMOTION_SYNONYMS.update({
+    "슬픔": ["외로움","고독","무력감","허무감","공허함","좌절","절망","패배감","허탈","우울감","피곤","지침"],
+    "수치심": ["죄책감","후회","자책","열등감","한심함"],
+    "분노": ["억울함","원망"],
+    "불안": ["스트레스","초조함","불안정","긴장감"],
+    "혐오": ["불쾌","꺼림칙함"],
+    "당혹": ["혼란","헷갈림","난처함"],
+    "기대": ["설렘","희망"],
+})
+# 역매핑
 REVERSE_SYNONYM = {k: k for k in EMOTION_SYNONYMS.keys()}
 for k, syns in EMOTION_SYNONYMS.items():
     for s in syns:
@@ -104,9 +139,22 @@ def normalize_emotion(label: str) -> str:
     if not label: return label
     return REVERSE_SYNONYM.get(str(label).strip(), str(label).strip())
 
-# ─────────────────────────────────────────────────────────────────────────────
+EMO_AVG_MODE = os.getenv("HF_EMO_AVG_MODE", "top2")  # mean|max|top2|top3...
+def _agg(vals):
+    if not vals: return 0.0
+    if EMO_AVG_MODE == "max":
+        return float(max(vals))
+    if EMO_AVG_MODE.startswith("top"):
+        try: k = int(EMO_AVG_MODE[3:])
+        except: k = 2
+        vals = sorted(vals, reverse=True)[:max(1,k)]
+    return float(sum(vals)/len(vals))
+
+
+# ===============================================================================
 # Firestore or LocalStore 추상화
-# ─────────────────────────────────────────────────────────────────────────────
+# ===============================================================================
+
 class Store:
     def __init__(self):
         # 환경변수로 강제 선택 가능: HF_STORE_MODE=local|firestore
@@ -208,9 +256,9 @@ store = Store()
 def now_iso():
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
 # 수치 유틸: 정규화 엔트로피, Platt, Isotonic, 메트릭
-# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
 def normalized_entropy_from_scores(scores: List[float]) -> float:
     if not scores: return 0.0
     s = sum(scores)
@@ -305,9 +353,10 @@ def compute_metrics(ps: List[float], ys: List[int], bins=10) -> Dict[str,float]:
         user_corr = 0.0
     return {"ece": float(ece), "brier": float(brier), "em": float(acc), "f1": float(f1), "user_corr": user_corr}
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ===============================================================================
 # 엔드포인트: 헬스/제로샷/NLI/점수
-# ─────────────────────────────────────────────────────────────────────────────
+# ===============================================================================
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "zsl_model": ZSL_MODEL_NAME, "nli_model": NLI_MODEL_NAME})
@@ -319,7 +368,13 @@ def zero_shot_api():
     labels = data.get("labels") or DEFAULT_EMOTION_LABELS
     if not text or not isinstance(labels, list) or len(labels)==0:
         return jsonify({"error": "input and labels are required"}), 400
-    out = zero_shot(text, candidate_labels=labels, multi_label=True)
+    out = zero_shot(
+        text,
+        candidate_labels=labels,
+        multi_label=True,
+        hypothesis_template=EMOTION_TEMPLATE,
+        batch_size=HF_BATCH,
+    )
     return jsonify({"labels": out["labels"], "scores": out["scores"]})
 
 @app.post("/nli")
@@ -342,53 +397,133 @@ def nli_api():
         })
     return jsonify({"results": results})
 
+def _split_sentences_ko(text: str):
+    # 문장 분할: 줄바꿈, 문장 종결부호(., ?, !, …) 또는 "다." 패턴
+    sents = re.split(r'(?:[\n\r]+|(?<=[\.!\?…])\s+|(?<=다\.)\s+)', text)
+    return [s.strip() for s in sents if isinstance(s, str) and len(s.strip()) >= 3]
+
 @app.post("/scores")
 def scores_api():
     data = request.get_json(silent=True) or {}
     text = str(data.get("text", "")).strip()
     if not text:
         return jsonify({"error": "text required"}), 400
+
     core_belief = str(data.get("coreBelief", data.get("core_belief", ""))).strip()
     emotions_in = data.get("emotions") or []
     emotions_norm = [normalize_emotion(e) for e in emotions_in if isinstance(e, str)]
 
-    # 1) 감정 분포
-    emo_out = zero_shot(text, candidate_labels=DEFAULT_EMOTION_LABELS, multi_label=True)
-    labels = emo_out["labels"]; scores = [float(s) for s in emo_out["scores"]]
-    emo_probs = {}
-    for lab, sc in zip(labels, scores):
-        canon = normalize_emotion(lab)
-        emo_probs[canon] = max(sc, emo_probs.get(canon, 0.0))
+    # 세그먼트 플래그
+    segment = False
+    try:
+        q = (request.args.get("segment") or "").lower()
+        segment = q in ("1","true","yes")
+    except Exception:
+        pass
+    if isinstance(data.get("segment"), bool):
+        segment = segment or bool(data.get("segment"))
 
-    chosen = [emo_probs.get(l, 0.0) for l in emotions_norm] if emotions_norm else []
-    emotions_avg = float(sum(chosen)/len(chosen)) if len(chosen)>0 else 0.0
-    emotion_entropy = normalized_entropy_from_scores(scores)
+    if not segment:
+        # --- 단일 텍스트
+        emo_out = zero_shot(
+            text,
+            candidate_labels=DEFAULT_EMOTION_LABELS,
+            multi_label=True,
+            hypothesis_template=EMOTION_TEMPLATE,
+            batch_size=HF_BATCH,
+        )
+        labels = emo_out["labels"]
+        scores = [float(s) for s in emo_out["scores"]]
 
-    # 2) 핵심믿음 NLI
-    nli_result = {"entail": 0.0, "neutral": 0.0, "contradict": 0.0}
+        emo_probs = {}
+        for lab, sc in zip(labels, scores):
+            canon = normalize_emotion(lab)
+            emo_probs[canon] = max(sc, emo_probs.get(canon, 0.0))
+
+        chosen = [emo_probs.get(l, 0.0) for l in emotions_norm] if emotions_norm else []
+        emotions_avg = _agg(chosen)
+        emotion_entropy = normalized_entropy_from_scores(scores)
+
+        nli_result = {"entail": 0.0, "neutral": 0.0, "contradict": 0.0}
+        if core_belief:
+            pair = text + " </s></s> " + core_belief
+            pred = nli_clf(pair, top_k=3)
+            label_map = {p["label"]: p["score"] for p in pred}
+            nli_result = {
+                "entail": float(label_map.get("entailment", 0.0)),
+                "neutral": float(label_map.get("neutral", 0.0)),
+                "contradict": float(label_map.get("contradiction", 0.0)),
+            }
+
+        return jsonify({
+            "emotions_avg": emotions_avg,
+            "emotion_entropy": emotion_entropy,
+            "nli_core": {"entail": nli_result["entail"], "contradict": nli_result["contradict"]},
+            "hf_raw": {
+                "emotion": {"avg": emotions_avg, "entropy": emotion_entropy, "probs": emo_probs},
+                "nli_core": nli_result
+            }
+        })
+
+    # === 세그먼트 ON: 문장별 배치 ===
+    sents = _split_sentences_ko(text) or [text]
+    label_list = [normalize_emotion(l) for l in DEFAULT_EMOTION_LABELS]
+
+    sum_probs = {l: 0.0 for l in label_list}
+    entropies = []
+
+    outs = zero_shot(
+        sents,
+        candidate_labels=DEFAULT_EMOTION_LABELS,
+        multi_label=True,
+        hypothesis_template=EMOTION_TEMPLATE,
+        batch_size=HF_BATCH,
+    )
+    for out in outs:
+        labels = out["labels"]; scores = [float(v) for v in out["scores"]]
+        prob_map = {normalize_emotion(l): sc for l, sc in zip(labels, scores)}
+        entropies.append(normalized_entropy_from_scores(scores))
+        for l in label_list:
+            sum_probs[l] += float(prob_map.get(l, 0.0))
+
+    n_sent = float(len(sents))
+    avg_probs = {l: (sum_probs[l] / n_sent) for l in label_list}
+
+    chosen = [avg_probs.get(l, 0.0) for l in emotions_norm] if emotions_norm else []
+    emotions_avg = _agg(chosen)
+    emotion_entropy = float(sum(entropies)/len(entropies)) if entropies else \
+        normalized_entropy_from_scores(list(avg_probs.values()))
+
+    # 문장별 NLI(간단 루프; 필요 시 배치로 최적화 가능)
+    nli_es, nli_ns, nli_cs = [], [], []
     if core_belief:
-        pair = text + " </s></s> " + core_belief
-        pred = nli_clf(pair, top_k=3)
-        label_map = {p["label"]: p["score"] for p in pred}
-        nli_result = {
-            "entail": float(label_map.get("entailment", 0.0)),
-            "neutral": float(label_map.get("neutral", 0.0)),
-            "contradict": float(label_map.get("contradiction", 0.0)),
-        }
+        for s in sents:
+            pair = s + " </s></s> " + core_belief
+            pred = nli_clf(pair, top_k=3)
+            lm = {p["label"]: p["score"] for p in pred}
+            nli_es.append(float(lm.get("entailment", 0.0)))
+            nli_ns.append(float(lm.get("neutral", 0.0)))
+            nli_cs.append(float(lm.get("contradiction", 0.0)))
+
+    entail = float(sum(nli_es)/len(nli_es)) if nli_es else 0.0
+    neutral = float(sum(nli_ns)/len(nli_ns)) if nli_ns else 0.0
+    contradict = float(sum(nli_cs)/len(nli_cs)) if nli_cs else 0.0
 
     return jsonify({
         "emotions_avg": emotions_avg,
         "emotion_entropy": emotion_entropy,
-        "nli_core": { "entail": nli_result["entail"], "contradict": nli_result["contradict"] },
+        "nli_core": {"entail": entail, "contradict": contradict},
         "hf_raw": {
-            "emotion": { "avg": emotions_avg, "entropy": emotion_entropy, "probs": emo_probs },
-            "nli_core": nli_result
+            "emotion": {"avg": emotions_avg, "entropy": emotion_entropy, "probs": avg_probs},
+            "nli_core": {"entail": entail, "neutral": neutral, "contradict": contradict}
         }
     })
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ===============================================================================
 # Phase 3: 캘리브레이션 학습/저장/프로필/리포트
-# ─────────────────────────────────────────────────────────────────────────────
+# ===============================================================================
+
 # 학습 데이터 스키마(권장):
 # /users/{uid}/feedback/{messageId}:
 # {
@@ -542,9 +677,9 @@ def eval_latest():
     else:
         return jsonify({})
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
 # Phase 4: 모델 핫-리로드(LoRA/Adapter 아티팩트 전환)
-# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
 @app.post("/admin/reload")
 def admin_reload():
     global ZSL_MODEL_NAME, NLI_MODEL_NAME  # 참조 전에 global 선언 필수
@@ -555,9 +690,10 @@ def admin_reload():
         load_models(new_zsl, new_nli)
     return jsonify({"ok": True, "zsl_model": ZSL_MODEL_NAME, "nli_model": NLI_MODEL_NAME})
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
 # 발표/요약 카드(참고)
-# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+
 def _analyze_summary_logic(text: str):
     pol = zero_shot(text, candidate_labels=DEFAULT_POLARITY_LABELS, multi_label=False)
     pol_label = pol["labels"][0]; pol_score = pol["scores"][0]
@@ -586,9 +722,10 @@ def analyze_strength_api():
 def analyze_strength_alias():
     return analyze_strength_api()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
 # 엔트리포인트
-# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5001"))
     app.run(host="0.0.0.0", port=port)

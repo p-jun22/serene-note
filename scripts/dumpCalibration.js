@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-/**
- * scripts/dumpCalibration.js
+/* scripts/dumpCalibration.js
  * - users/{uid}/profile/calibration 문서를 덤프한다.
  * - 출력 스키마는 gptService가 기대하는 최신 형식:
  *   { "uid": { "global": {...}, "personal": {...}, "updatedAt": ... }, ... }
@@ -16,7 +15,7 @@
 const fs = require('fs');
 const yargs = require('yargs');
 const { hideBin } = require('yargs/helpers');
-const { admin, db } = require('../backend/firebaseAdmin');
+const { admin, db } = require('../backend/firebaseAdminbaseAdmin');
 
 const argv = yargs(hideBin(process.argv))
   .option('uid', { type: 'string', desc: '대상 UID' })

@@ -1,12 +1,11 @@
 // backend/services/http.js
-// [역할]
+
 // - axios 공통 인스턴스 생성 및 표준화된 요청/응답/에러 처리
 // - HF 서버 등 외부 서비스 호출에 공통 사용
-//
-// [핵심]
+
 // - 기본 타임아웃/헤더/베이스URL/에러 포맷 통일
 // - 요청/응답 인터셉터로 로깅 및 에러 정규화
-// - (선택) HF 토큰 헤더 자동 주입
+// - HF 토큰 헤더 자동 주입
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -35,7 +34,6 @@ function createAxios({ baseURL = '', timeout = DEFAULT_TIMEOUT_MS, headers = {} 
       'Content-Type': 'application/json',
       ...headers,
     },
-    // 필요 시 proxy, httpsAgent 등 추가
   });
 
   // 요청 인터셉터: 요청 ID/로그/토큰
@@ -48,9 +46,8 @@ function createAxios({ baseURL = '', timeout = DEFAULT_TIMEOUT_MS, headers = {} 
       config.headers['Authorization'] = `Bearer ${HF_TOKEN}`;
     }
 
-    // 개발 시 간단 로깅 (원하면 주석 처리)
+    // 개발 로깅 (로그 너무 시끄러워서 주석 처리)
     if (process.env.NODE_ENV !== 'production') {
-      // 콘솔 너무 시끄러우면 아래 한 줄 주석
       // console.log('[HTTP]', config.method?.toUpperCase(), config.baseURL || '', config.url);
     }
     return config;

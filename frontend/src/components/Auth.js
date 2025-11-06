@@ -1,3 +1,5 @@
+// src/components/Auth.js
+
 import React, { useState } from 'react';
 import {
   signInWithEmailAndPassword,
@@ -6,7 +8,7 @@ import {
 } from 'firebase/auth';
 import { auth } from '../firebase';
 
-// Firebase 에러 코드 → 한글 메시지 매핑
+// Firebase 에러 코드 -> 한글 메시지 변환
 function prettyError(code) {
   switch (code) {
     case 'auth/invalid-credential':
@@ -38,7 +40,7 @@ export default function Auth() {
 
   const isSignup = tab === 'signup';
 
-  // ▶ 명시적 회원가입 규칙
+  // ㅁ 명시적 회원가입 규칙
   // 1) 길이 8자 이상
   // 2) 영문 + 숫자 포함
   // 3) 비밀번호 확인과 일치
@@ -58,7 +60,7 @@ export default function Auth() {
     try {
       if (isSignup) {
         await createUserWithEmailAndPassword(auth, email, pw);
-        // 성공 시 자동 로그인 → App에서 캘린더 진입
+        // 성공 시 자동 로그인 -> App에서 캘린더 진입
       } else {
         await signInWithEmailAndPassword(auth, email, pw);
       }
@@ -79,7 +81,7 @@ export default function Auth() {
     }
   };
 
-  // 규칙 라인 UI (체크/엑스와 색상으로 명확히)
+  // 규칙 UI
   const Rule = ({ ok, children }) => (
     <div style={{ display:'flex', alignItems:'center', gap:8, padding:'2px 0',
                   color: ok ? 'var(--success)' : '#b84c4c' }}>
@@ -171,7 +173,7 @@ export default function Auth() {
                 </div>
               </label>
 
-              {/* 🔎 규칙 체크리스트(실시간) */}
+              {/* 규칙 체크리스트 */}
               <div style={{ fontSize:12, marginTop:6 }} aria-live="polite">
                 <Rule ok={minLenOk}>길이 8자 이상</Rule>
                 <Rule ok={comboOk}>영문 + 숫자 포함</Rule>

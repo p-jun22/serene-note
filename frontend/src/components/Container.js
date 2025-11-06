@@ -1,6 +1,5 @@
 // src/components/Container.js
-// 달력 프리젠테이션 전용 (App.css 구조에 맞춤)
-// - .calendar > .weekdays / .days / .cell 클래스를 사용.
+// 달력 프리젠테이션 전용
 // - 셀 클릭 시 onSelect(YYYY-MM-DD) 호출.
 
 import React, { useMemo } from "react";

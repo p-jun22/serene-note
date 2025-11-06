@@ -10,7 +10,7 @@ import CalendarPage from './components/CalendarPage';
 import EmotionGraphPage from './components/EmotionGraphPage';
 import AccuracyAnalysis from './components/AccuracyAnalysis';
 import StrengthWeaknessPage from './components/StrengthWeaknessPage';
-import SharePage from './components/SharePage';
+// import SharePage from './components/SharePage';
 import ChatBot from './components/ChatBot';
 import DiaryListPage from './components/DiaryListPage';
 
@@ -71,7 +71,7 @@ export default function App() {
     if (page === 'graph') return <EmotionGraphPage key={`graph-${user?.uid || 'anon'}`} includeStrengthGraph={true} />;
     if (page === 'accuracy') return <AccuracyAnalysis key={`acc-${user?.uid || 'anon'}`} />;
     if (page === 'analysis') return <StrengthWeaknessPage key={`ana-${user?.uid || 'anon'}`} includeOnlyAnalysis={true} />;
-    if (page === 'share') return <SharePage key={`share-${user?.uid || 'anon'}`} />;
+    // if (page === 'share') return <SharePage key={`share-${user?.uid || 'anon'}`} />;
     return <CalendarPage key={`cal-${user?.uid || 'anon'}`} onWrite={(date) => setSelectedDate(date)} />;
   }, [page, selectedDate, user?.uid]);
 
@@ -117,9 +117,9 @@ export default function App() {
             <Tab id="calendar">캘린더</Tab>
             <Tab id="archive">기록 보기</Tab>
             <Tab id="graph">감정 그래프</Tab>
-            <Tab id="accuracy">정확도 분석</Tab>
-            <Tab id="analysis">강점·약점</Tab>
-            <Tab id="share">공유</Tab>
+            <Tab id="accuracy">정합·정확도 분석</Tab>
+            <Tab id="analysis">정합·정확도 평가</Tab>
+            {/* <Tab id="share">공유</Tab> */}
           </nav>
           <main>{renderPage}</main>
         </>

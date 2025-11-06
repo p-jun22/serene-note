@@ -1,16 +1,14 @@
 // backend/services/firestoreRepository.js
 // ─────────────────────────────────────────────────────────────
-// [역할 요약]
 // 1) Firestore I/O 단일 창구 (대화/메시지 CRUD)
-// 2) 캘린더 집계(recomputeCalendar) - ★ 레거시 루트 미러 완전 제거
+// 2) 캘린더 집계(recomputeCalendar)
 // 3) 분석/그래프용 조회 유틸 (세션/월 범위 조회 등)
-// 4) Stage-2/멱등성 준비 유틸(countUserMessages 등)
-//
-// [핵심 정책 반영]
+// 4) Stage-2/dup 준비 유틸(countUserMessages 등)
+
+// ─────────────────────────────────────────────────────────────
 // - 경로 스키마(불변):
 //   users/{uid}/sessions/{dateKey}/conversations/{cid}/messages/{mid}
-//   users/{uid}/sessions/{dateKey}/calendar/summary     ← ★ 단일 SOT
-// - 레거시(users/{uid}/calendar/{dateKey}) 경로: ★ 완전 폐기 (읽기/쓰기 모두 금지)
+//   users/{uid}/sessions/{dateKey}/calendar/summary
 // - 서버 시간은 FieldValue.serverTimestamp()만 사용 (클라 시간 금지)
 // - 집계 필요 변경 시 recomputeCalendar(uid, dateKey) 반드시 호출
 // ─────────────────────────────────────────────────────────────
@@ -36,7 +34,7 @@ function plus1day(k) {
 }
 
 /* ─────────────────────────────────────────────
-   1) 경로 헬퍼 (Tree.txt 기준, 이름/구조 변경 금지)
+   1) 경로 헬퍼 (Tree.txt)
 ───────────────────────────────────────────── */
 function userDoc(uid) { return db.collection('users').doc(String(uid)); }
 function sessionDoc(uid, dateKey) { return userDoc(uid).collection('sessions').doc(String(dateKey)); }
@@ -121,11 +119,11 @@ function extractSnapshotVectors(snap = {}, hf_raw = {}) {
 }
 
 /* ─────────────────────────────────────────────
-   4) 캘린더 집계 — “빈날 삭제(미생성)” 정책
+   4) 캘린더 집계 - “빈날 삭제(미생성) 정책
    - 저장 위치: users/{uid}/sessions/{dateKey}/calendar/summary 단일
-   - count는 “user 메시지가 1개 이상 존재하는 대화 수”
+   - count는 user 메시지가 1개 이상 존재하는 대화 수
    - 대화 메타에 감정 라벨이 없으면 최신 user 메시지에서 보강
-   - count===0이면 summary 문서 삭제 후 null 반환(프론트에 표시 안 함)
+   - count === 0이면 summary 문서 삭제 후 null 반환(프론트에 표시 안 함)
    - 대화 문서 메타만 사용(O(N))
 ───────────────────────────────────────────── */
 async function recomputeCalendar({ uid, sessionId }) {
@@ -167,7 +165,7 @@ async function recomputeCalendar({ uid, sessionId }) {
     return null;
   }
 
-  // 최빈 라벨 → topEmoji
+  // 최빈 라벨 => topEmoji
   let topEmoji = null, max = -1, topLabel = null;
   for (const [label, c] of Object.entries(moodCounters)) {
     if (c > max) { max = c; topLabel = label; }
@@ -191,7 +189,7 @@ async function recomputeCalendar({ uid, sessionId }) {
 
 
 /* ─────────────────────────────────────────────
-   5) 캘린더 범위 조회 — 하이브리드 자기치유(빈날 스킵)
+   5) 캘린더 범위 조회 - 하이브리드 자기치유(빈날 스킵)
    - group 쿼리로 긁고, 누락 날짜는 on-demand 재집계
    - 재집계 결과 count===0이면 out에 넣지 않음(표시 안 함)
 ───────────────────────────────────────────── */
@@ -610,6 +608,32 @@ async function getLastUserSnapshot({ uid, sessionId, conversationId }) {
 }
 
 
+// users/{uid}/feedbackCompare/{pairId} : 승자만 저장
+async function saveCompareFeedback(uid, { pairId, winner, variants }) {
+  const ref = db.collection('users').doc(String(uid))
+    .collection('feedbackCompare').doc(String(pairId));
+  await ref.set({
+    winner,
+    variants: variants || null, // {left:'A', right:'B'}
+    updatedAt: nowTS(),
+    createdAt: nowTS(),
+  }, { merge: true });
+}
+
+// users/{uid}/feedbackCompareMeta/{pairId} : 입력 해시/변형명만 (출력 저장X)
+async function logComparePairMeta(uid, { pairId, dateKey, inputHash, variants }) {
+  const ref = db.collection('users').doc(String(uid))
+    .collection('feedbackCompareMeta').doc(String(pairId));
+  await ref.set({
+    dateKey: String(dateKey || ''),
+    inputHash: String(inputHash || ''),
+    variants: variants || null,
+    createdAt: nowTS(),
+  }, { merge: true });
+}
+
+
+
 /* ─────────────────────────────────────────────
    11) 모듈 export
 ───────────────────────────────────────────── */
@@ -645,4 +669,9 @@ module.exports = {
 
   // 레거시 호환
   setUserRating,
+
+
+  // 피드백 비교 저장
+  saveCompareFeedback,
+  logComparePairMeta,
 };

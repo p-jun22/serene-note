@@ -1,7 +1,6 @@
 #!/usr/bin/env node
-/**
- * scripts/trainCalibration.js
- * ─────────────────────────────────────────────────────────────────────────────
+/* scripts/trainCalibration.js
+ * ===============================================================================
  * 역할
  *  - Firestore의 메시지/피드백을 모아 전역/개인 캘리브레이션 파라미터(Platt 또는 Isotonic)를 학습.
  *  - 결과를 users/{uid}/profile/calibration 문서에 저장(전역은 모든 유저에 공통, 개인은 각 유저별).
@@ -36,6 +35,8 @@ const argv = yargs(hideBin(process.argv))
   .option('min-samples', { type: 'number', default: 20, desc: '개인 보정 활성화 최소 표본' })
   .option('dry-run', { type: 'boolean', desc: '저장하지 않고 결과만 출력' })
   .demandOption(['method'], 'method는 필수입니다.')
+  .option('include-uids', { type: 'string', desc: '쉼표구분 UID 화이트리스트' })
+  .option('exclude-uids', { type: 'string', desc: '쉼표구분 UID 블랙리스트' })
   .check((a) => {
     if (!a.global && !a.uid && !a['all-personal']) {
       throw new Error('하나 이상 지정: --global 또는 --uid 또는 --all-personal');
@@ -45,15 +46,53 @@ const argv = yargs(hideBin(process.argv))
   .help().argv;
 
 /* ───────── 날짜 헬퍼 ───────── */
-function ymd(d){ return new Date(d).toISOString().slice(0,10); }
-function addDays(d, k){ const x = new Date(d); x.setUTCDate(x.getUTCDate()+k); return x; }
-function rangeFromArgs(a){
+function ymd(d) { return new Date(d).toISOString().slice(0, 10); }
+function addDays(d, k) { const x = new Date(d); x.setUTCDate(x.getUTCDate() + k); return x; }
+function rangeFromArgs(a) {
   const now = new Date();
-  if (a.from && a.to) return { from: new Date(a.from+'T00:00:00Z'), to: new Date(a.to+'T23:59:59Z') };
+  if (a.from && a.to) return { from: new Date(a.from + 'T00:00:00Z'), to: new Date(a.to + 'T23:59:59Z') };
   const to = now;
   const from = addDays(now, -Math.max(1, a.days));
   return { from, to };
 }
+
+// 유저별 admin 여부 로드
+async function loadAdminUIDs() {
+  const us = await db.collection('users').get();
+  const adminUIDs = new Set();
+  const allUIDs = [];
+  us.forEach(doc => {
+    const d = doc.data() || {};
+    allUIDs.push(doc.id);
+    // users/{uid} 문서에 { admin: 'admin' } 형태가 있으면 관리자
+    if (d.admin === 'admin') adminUIDs.add(doc.id);
+  });
+  return { adminUIDs, allUIDs };
+}
+
+// 유저별 feedback 맵 구축: { uid: Map(conversationId -> usefulScore) }
+async function buildFeedbackMaps(uids) {
+  const out = new Map();
+  for (const uid of uids) {
+    const mp = new Map();
+    const snap = await db.collection('users').doc(uid).collection('feedback').get();
+    snap.forEach(doc => {
+      const fd = doc.data() || {};
+      const cid = fd.conversationId;
+      const useful = Number(fd?.ratings?.useful);
+      if (cid && Number.isFinite(useful)) mp.set(cid, useful);
+    });
+    out.set(uid, mp);
+  }
+  return out;
+}
+
+// 메시지 도큐먼트에서 conversationId 추출
+function getConversationIdFromMessageDoc(doc) {
+  // users/{uid}/sessions/{dateKey}/conversations/{cid}/messages/{mid}
+  return doc.ref.parent.parent.id;
+}
+
 
 /* ───────── 데이터 적재 ─────────
  * messages 컬렉션 구조: users/{uid}/sessions/{dateKey}/conversations/{cid}/messages/{mid}
@@ -64,6 +103,8 @@ function rangeFromArgs(a){
  *   · message.userScore (1..5) 또는 별도 feedback 저장소 (여기선 message에 있다고 가정)
  */
 async function loadDataset({ uid, from, to }) {
+  const fbMaps = await buildFeedbackMaps([uid]);
+  const { adminUIDs } = await loadAdminUIDs();
   // Firestore collectionGroup 쿼리
   let q = db.collectionGroup('messages')
     .where('role', '==', 'user')
@@ -74,29 +115,32 @@ async function loadDataset({ uid, from, to }) {
 
   const snap = await q.get();
   const rows = [];
+
   snap.forEach(doc => {
     const d = doc.data() || {};
-    const snapV1 = d.analysisSnapshot_v1 || {};
-    const conf = snapV1.confidences || {};
-    const hf = snapV1.hf || {};
-    const createdAt = d.createdAt?.toDate?.() || null;
+    const s = d.analysisSnapshot_v1 || {};
+    const conf = s.confidences || {};
+    const hf = s.hf || {};
 
-    // p: 보정 전 _final_raw (없으면 스킵)
     const p = Number(conf?._final_raw);
     if (!Number.isFinite(p)) return;
 
-    // y: 라벨
+    const convId = getConversationIdFromMessageDoc(doc);
     let y = null;
-    const score = Number(d.userScore ?? d.feedbackScore);
-    if (Number.isFinite(score)) {
-      y = score >= 4 ? 1 : 0;
+    const fb = fbMaps.get(uid)?.get(convId);
+    if (Number.isFinite(fb)) {
+      y = adminUIDs.has(uid) ? (fb >= 5 ? 1 : 0) : (fb >= 4 ? 1 : 0);
     } else {
-      const entail = Number(hf?.nli?.core?.entail ?? 0);
-      const contradict = Number(hf?.nli?.core?.contradict ?? 0);
-      const entropy = Number(hf?.emotion?.entropy ?? 1);
-      y = (entail - contradict >= 0.15) && (entropy <= 0.65) ? 1 : 0;
+      const score = Number(d.userScore ?? d.feedbackScore);
+      if (Number.isFinite(score)) y = score >= 4 ? 1 : 0;
+      else {
+        const entail = Number(hf?.nli?.core?.entail ?? 0);
+        const contradict = Number(hf?.nli?.core?.contradict ?? 0);
+        const entropy = Number(hf?.emotion?.entropy ?? 1);
+        y = (entail - contradict >= 0.15) && (entropy <= 0.65) ? 1 : 0;
+      }
     }
-    rows.push({ p: Math.max(0, Math.min(1, p)), y, createdAt, uid: d.uid || uid || 'unknown' });
+    rows.push({ p: Math.max(0, Math.min(1, p)), y, createdAt: d.createdAt?.toDate?.() || null, uid });
   });
   return rows;
 }
@@ -107,9 +151,9 @@ function brierScore(ds) {
   return ds.reduce((s, r) => s + Math.pow(r.p - r.y, 2), 0) / n;
 }
 function ece(ds, bins = 10) {
-  const arr = Array.from({ length: bins }, () => ({ n:0, p:0, y:0 }));
-  ds.forEach(({p,y}) => {
-    let b = Math.min(bins-1, Math.floor(p * bins));
+  const arr = Array.from({ length: bins }, () => ({ n: 0, p: 0, y: 0 }));
+  ds.forEach(({ p, y }) => {
+    let b = Math.min(bins - 1, Math.floor(p * bins));
     arr[b].n++; arr[b].p += p; arr[b].y += y;
   });
   let sum = 0, tot = 0;
@@ -125,13 +169,13 @@ function ece(ds, bins = 10) {
 /* ───────── Platt 학습(로지스틱) ─────────
  * 간단 SGD. 학습 안정 위해 작은 L2 적용.
  */
-function trainPlatt(ds, { lr=0.1, iters=2000, l2=1e-3 }) {
+function trainPlatt(ds, { lr = 0.1, iters = 2000, l2 = 1e-3 }) {
   let a = 1, b = 0; // 초기값
-  function sigmoid(z){ return 1/(1+Math.exp(-z)); }
+  function sigmoid(z) { return 1 / (1 + Math.exp(-z)); }
 
-  for (let t=0;t<iters;t++){
-    let ga=0, gb=0;
-    for (const {p,y} of ds) {
+  for (let t = 0; t < iters; t++) {
+    let ga = 0, gb = 0;
+    for (const { p, y } of ds) {
       const z = a * p + b;
       const pred = sigmoid(z);
       const err = (pred - y);
@@ -151,78 +195,78 @@ function trainPlatt(ds, { lr=0.1, iters=2000, l2=1e-3 }) {
 /* ───────── Isotonic(PAV) ───────── */
 function trainIsotonic(ds) {
   // 정렬
-  const xs = ds.slice().sort((u,v)=>u.p-v.p).map(r => ({ p:r.p, y:r.y, w:1 }));
+  const xs = ds.slice().sort((u, v) => u.p - v.p).map(r => ({ p: r.p, y: r.y, w: 1 }));
   // pool-adjacent-violators
-  for (let i=0;i<xs.length;i++){
+  for (let i = 0; i < xs.length; i++) {
     xs[i].avg = xs[i].y / xs[i].w;
-    while (i>0 && xs[i-1].avg > xs[i].avg) {
-      const a=xs[i-1], b=xs[i];
+    while (i > 0 && xs[i - 1].avg > xs[i].avg) {
+      const a = xs[i - 1], b = xs[i];
       const nw = a.w + b.w;
       const ny = a.y + b.y;
-      xs.splice(i-1, 2, { p:b.p, y:ny, w:nw, avg: ny/nw });
+      xs.splice(i - 1, 2, { p: b.p, y: ny, w: nw, avg: ny / nw });
       i--;
     }
   }
   // bins/map 구성(등분할)
   const B = 10;
-  const bins = Array.from({length:B+1}, (_,i)=> i/B);
+  const bins = Array.from({ length: B + 1 }, (_, i) => i / B);
   const map = [];
-  for (let i=0;i<B;i++){
-    const lo = bins[i], hi = bins[i+1];
+  for (let i = 0; i < B; i++) {
+    const lo = bins[i], hi = bins[i + 1];
     const seg = xs.filter(r => r.p >= lo && r.p < hi);
     if (!seg.length) {
       // 인접 평균 보간
-      const prev = map[i-1] ?? 0;
+      const prev = map[i - 1] ?? 0;
       map.push(prev);
     } else {
-      const w = seg.reduce((s,r)=>s+r.w,0);
-      const y = seg.reduce((s,r)=>s+r.y,0);
-      map.push(y/w);
+      const w = seg.reduce((s, r) => s + r.w, 0);
+      const y = seg.reduce((s, r) => s + r.y, 0);
+      map.push(y / w);
     }
   }
   return { bins, map };
 }
 
 /* ───────── 학습/선택 ───────── */
-function calibrate(ds, method='auto'){
-  if (ds.length < 5) return { type:'none', model:null, metrics:{ n: ds.length } };
+function calibrate(ds, method = 'auto') {
+  if (ds.length < 5) return { type: 'none', model: null, metrics: { n: ds.length } };
 
   // 원본 메트릭
   const base = { brier: brierScore(ds), ece: ece(ds), n: ds.length };
 
   const out = { base };
-  let best = { type:'base', brier: base.brier, ece: base.ece, model:null };
+  let best = { type: 'base', brier: base.brier, ece: base.ece, model: null };
 
   // Platt
   if (method === 'platt' || method === 'auto') {
     const pl = trainPlatt(ds, {});
-    const dsPl = ds.map(({p,y}) => {
-      const z = pl.a * p + pl.b; const q = 1/(1+Math.exp(-z));
-      return { p:q, y };
+    const dsPl = ds.map(({ p, y }) => {
+      const z = pl.a * p + pl.b; const q = 1 / (1 + Math.exp(-z));
+      return { p: q, y };
     });
     const m = { brier: brierScore(dsPl), ece: ece(dsPl), n: ds.length };
     out.platt = { params: pl, metrics: m };
-    if (m.brier <= best.brier) best = { type:'platt', model:pl, brier:m.brier, ece:m.ece };
+    if (m.brier <= best.brier) best = { type: 'platt', model: pl, brier: m.brier, ece: m.ece };
   }
 
   // Isotonic
   if (method === 'isotonic' || method === 'auto') {
     const iso = trainIsotonic(ds);
-    const dsIso = ds.map(({p,y}) => {
-      const B=iso.bins.length-1; let b=Math.min(B-1, Math.floor(p*B));
+    const dsIso = ds.map(({ p, y }) => {
+      const B = iso.bins.length - 1; let b = Math.min(B - 1, Math.floor(p * B));
       const q = iso.map[b];
-      return { p:q, y };
+      return { p: q, y };
     });
     const m = { brier: brierScore(dsIso), ece: ece(dsIso), n: ds.length };
     out.isotonic = { params: iso, metrics: m };
-    if (m.brier < best.brier - 1e-6) best = { type:'isotonic', model:iso, brier:m.brier, ece:m.ece };
+    if (m.brier < best.brier - 1e-6) best = { type: 'isotonic', model: iso, brier: m.brier, ece: m.ece };
   }
 
   return { type: best.type, model: best.model, metrics: best, detail: out };
 }
 
 /* ───────── 저장 ───────── */
-async function upsertGlobal(model){
+async function upsertGlobal(model) {
   const ref = db.collection('users').doc('_GLOBAL_').collection('profile').doc('calibration');
   const body = (model.type === 'platt')
     ? { global: { platt: model.model } }
@@ -234,7 +278,7 @@ async function upsertGlobal(model){
   console.log('[OK] wrote GLOBAL calibration profile -> users/_GLOBAL_/profile/calibration');
 }
 
-async function upsertPersonal(uid, model, n, minSamples){
+async function upsertPersonal(uid, model, n, minSamples) {
   const ref = db.collection('users').doc(String(uid)).collection('profile').doc('calibration');
   const body = (model.type === 'platt')
     ? { personal: { platt: model.model, rated_samples: n, min_samples: minSamples } }
@@ -247,10 +291,14 @@ async function upsertPersonal(uid, model, n, minSamples){
 }
 
 /* ───────── 메인 ───────── */
-(async ()=>{
+(async () => {
   const { from, to } = rangeFromArgs(argv);
 
   if (argv.global) {
+    const { adminUIDs, allUIDs } = await loadAdminUIDs();
+    const fbMaps = await buildFeedbackMaps(allUIDs);
+
+
     // 전유저 데이터 합산
     const snap = await db.collectionGroup('messages')
       .where('role', '==', 'user')
@@ -259,24 +307,45 @@ async function upsertPersonal(uid, model, n, minSamples){
       .get();
 
     const ds = [];
+
+    const include = new Set((argv['include-uids'] || '').split(',').filter(Boolean));
+    const exclude = new Set((argv['exclude-uids'] || '').split(',').filter(Boolean));
+
     snap.forEach(doc => {
       const d = doc.data() || {};
+      const uid = d.uid || 'unknown';
+      if (include.size && !include.has(uid)) return; // include가 있으면 그 안만
+      if (exclude.has(uid)) return;                  // 제외목록이면 스킵
+
       const s = d.analysisSnapshot_v1 || {};
       const conf = s.confidences || {};
       const hf = s.hf || {};
       const p = Number(conf?._final_raw);
       if (!Number.isFinite(p)) return;
 
+      const convId = getConversationIdFromMessageDoc(doc);
+
+      // 1) feedback 서브콜렉션 기반 라벨 우선
       let y = null;
-      const score = Number(d.userScore ?? d.feedbackScore);
-      if (Number.isFinite(score)) y = score >= 4 ? 1 : 0;
-      else {
-        const entail = Number(hf?.nli?.core?.entail ?? 0);
-        const contradict = Number(hf?.nli?.core?.contradict ?? 0);
-        const entropy = Number(hf?.emotion?.entropy ?? 1);
-        y = (entail - contradict >= 0.15) && (entropy <= 0.65) ? 1 : 0;
+      const fb = fbMaps.get(uid)?.get(convId);
+      if (Number.isFinite(fb)) {
+        // 관리자 vs 일반 규칙 분기
+        if (adminUIDs.has(uid)) y = (fb >= 5 ? 1 : 0);
+        else y = (fb >= 4 ? 1 : 0);
+      } else {
+        // 2) 메시지 내 score 백업 경로(있다면)
+        const score = Number(d.userScore ?? d.feedbackScore);
+        if (Number.isFinite(score)) {
+          y = score >= 4 ? 1 : 0;
+        } else {
+          // 3) HF fallback
+          const entail = Number(hf?.nli?.core?.entail ?? 0);
+          const contradict = Number(hf?.nli?.core?.contradict ?? 0);
+          const entropy = Number(hf?.emotion?.entropy ?? 1);
+          y = (entail - contradict >= 0.15) && (entropy <= 0.65) ? 1 : 0;
+        }
       }
-      ds.push({ p: Math.max(0, Math.min(1,p)), y });
+      ds.push({ p: Math.max(0, Math.min(1, p)), y });
     });
 
     if (!ds.length) {

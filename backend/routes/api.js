@@ -12,6 +12,8 @@ router.use(express.json()); // body 파서
 
 const { authMiddleware } = require('../middlewares/authMiddleware');
 const { admin, db } = require('../firebaseAdmin');
+
+const crypto = require('crypto');
 const repo = require('../services/firestoreRepository');
 const gpt = require('../services/gptService');
 
@@ -48,7 +50,7 @@ router.get('/models/strength/health', authMiddleware, async (_req, res) => {
 // 1) Messages
 // ─────────────────────────────────────────────
 
-/**
+/*
  * POST /api/messages
  * body: { sessionId|dateKey, conversationId|cid, text|content|message.text, correlationId? }
  * - assistant 메시지 저장 전용
@@ -88,7 +90,7 @@ router.post('/messages', authMiddleware, async (req, res) => {
       return res.json({ ok: true, skipped: 'empty_text' });
     }
 
-    // (옵션) 멱등: correlationId 중복 방지
+    // (옵션) duplication: correlationId 중복 방지
     if (correlationId && typeof repo.findAssistantByCorrelation === 'function') {
       const dup = await repo.findAssistantByCorrelation({ uid, sessionId, conversationId, correlationId });
       if (dup) return res.json({ ok: true, dedup: true });
@@ -108,9 +110,7 @@ router.post('/messages', authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * GET /api/conversations/:conversationId/messages?sessionId=YYYY-MM-DD&limit=1000
- */
+// GET /api/conversations/:conversationId/messages?sessionId=YYYY-MM-DD&limit=1000
 router.get('/conversations/:conversationId/messages', authMiddleware, async (req, res) => {
   try {
     const uid = req.user?.uid;
@@ -434,83 +434,76 @@ router.post('/gpt/analyze', authMiddleware, async (req, res) => {
     if (!dateKey || !conversationId) return fail(res, 400, 'bad_params', { dateKey, conversationId });
     if (!text) return res.status(400).json({ ok: false, error: 'text_required' });
 
-    // 멱등: clientMessageId 중복 시 기존 결과 반환
+    // duplication 처리: 같은 clientMessageId면 기존 결과 즉시 리턴
     if (clientMessageId && typeof repo.findUserMessageByClientKey === 'function') {
       const dup = await repo.findUserMessageByClientKey({
-        uid,
-        sessionId: dateKey,
-        conversationId,
-        clientMessageId,
+        uid, sessionId: dateKey, conversationId, clientMessageId,
       });
       if (dup) {
+        const { db } = require('../firebaseAdmin');
         const msgRef = db.doc(`users/${uid}/sessions/${dateKey}/conversations/${conversationId}/messages/${dup.id}`);
-        const snap = await msgRef.get();
-        const data = snap.data() || {};
+        const snap = await msgRef.get(); const data = snap.data() || {};
+
+        // 파이프라인 메타만 얹어서 회신
+        const email = (req.user?.email || '').toLowerCase();
+        const pipeline =
+          email === (BASELINE_EMAIL || 'basic@gmail.com') ? 'baseline' :
+          email === (ADMIN_EMAIL    || 'admin@gmail.com') ? 'admin'    : 'user';
+
         return res.json({
           ok: true,
           analysisSnapshot_v1: data.analysisSnapshot_v1 || null,
           hf_raw: data.hf_raw || null,
           dedup: true,
+          usedPrompts: null,
+          meta: { pipeline },
         });
       }
     }
 
+    // 계정 분기
     const email = (req.user?.email || '').toLowerCase();
     const isBaseline = email === BASELINE_EMAIL;
-    const isAdmin = !isBaseline && (email === ADMIN_EMAIL);
-    const isGeneral = !isBaseline && !isAdmin;
+    const isAdmin    = !isBaseline && (email === ADMIN_EMAIL);
+    const isGeneral  = !isBaseline && !isAdmin;
 
+    // 현재 대화에서 user턴 수 => 2번째부터 코칭
     let userCount = 0;
     if (typeof repo.countUserMessages === 'function') {
       userCount = await repo.countUserMessages({ uid, sessionId: dateKey, conversationId });
     }
-
-    const enableCoaching = (!isBaseline) && (userCount >= 1);
+    const enableCoaching   = (!isBaseline) && (userCount >= 1);
     const enableCorrection = (!isBaseline);
-    const mode = isBaseline ? 'baseline' : (isAdmin ? 'admin' : 'user');
-    const safetyOn = isGeneral;
+    const mode             = isBaseline ? 'baseline' : (isAdmin ? 'admin' : 'user');
+    const safetyOn         = isGeneral;
 
     const prevSnapshot =
       (typeof repo.getLastUserSnapshot === 'function')
         ? await repo.getLastUserSnapshot({ uid, sessionId: dateKey, conversationId })
         : null;
 
+    // 분석
     const { snapshot, hf_raw, usedPrompts, suggestRetry } = await gpt.analyzeMessage({
-      uid,
-      dateKey,
-      conversationId,
-      userText: text,
-      mode,
-      enableCoaching,
-      enableCorrection,
-      safetyOn,
-      prevSnapshot,
+      uid, dateKey, conversationId, userText: text,
+      mode, enableCoaching, enableCorrection, safetyOn, prevSnapshot,
     });
 
-    // 스냅샷/ HF 를 message 안에 넣어서 저장 (repo.addMessage는 message.*만 읽음)
-    await repo.addMessage({
-      uid,
-      sessionId: dateKey,
-      conversationId,
-      message: { role: 'user', text, clientMessageId, analysisSnapshot_v1: snapshot, hf_raw },
+    // 저장(공통 경로)
+    await gpt.persistAnalyzeResult({
+      uid, dateKey, conversationId, clientMessageId, userText: text, result: snapshot,
     });
 
     return res.json({
       ok: true,
       analysisSnapshot_v1: snapshot,
       hf_raw: hf_raw ?? null,
-
-      // ⬇ 회귀 방지를 위해 상위 레벨도 유지
       usedPrompts,
       suggestRetry: !!suggestRetry,
-
-      // ⬇ 프런트 분기/분석용 메타
       meta: {
-        pipeline: mode,               // 'baseline' | 'user' | 'admin'
-        coaching: enableCoaching,     // 두 번째 user 부터 true
-        correction: enableCorrection, // baseline이면 false, 그 외 true
-        isAdmin,                      // 디버깅/표시용(선택)
-        usedPrompts,                  // 중복 포함 OK
+        pipeline: mode,
+        coaching: enableCoaching,
+        correction: enableCorrection,
+        isAdmin,
         suggestRetry: !!suggestRetry,
       },
     });
@@ -585,6 +578,65 @@ router.get('/feedback/count', authMiddleware, async (req, res) => {
     return res.json({ ok: true, count });
   } catch (e) {
     return fail(res, 500, 'feedback_count_failed', e);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN 전용: 동일 입력 A/B 변형 생성(저장 없음) + 승자 기록
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/gpt/compare', authMiddleware, async (req, res) => {
+  try {
+    const email = (req.user?.email || '').toLowerCase();
+    const isAdmin = email === 'admin@gmail.com';
+    if (!isAdmin) return res.status(403).json({ ok: false, error: 'forbidden' });
+
+    const { text, dateKey, variantA = 'A', variantB = 'B' } = req.body || {};
+    if (!text || typeof text !== 'string') {
+      return res.status(400).json({ ok: false, error: 'bad_params' });
+    }
+
+    const pairId = crypto.randomUUID();
+
+    // 저장 없이 두 변형 실행 (save=false)
+    const left  = await gpt.runCBTAnalysis({ uid: req.user.uid, text, dateKey, variant: variantA, save: false });
+    const right = await gpt.runCBTAnalysis({ uid: req.user.uid, text, dateKey, variant: variantB, save: false });
+
+    // 텍스트 원문은 저장하지 않고 입력 해시/변형명만 메타로 기록
+    await repo.logComparePairMeta(req.user.uid, {
+      pairId,
+      dateKey: dateKey || new Date().toISOString().slice(0, 10),
+      inputHash: crypto.createHash('sha1').update(text).digest('hex'),
+      variants: { left: variantA, right: variantB },
+    });
+
+    return res.json({ ok: true, pairId, left, right });
+  } catch (e) {
+    console.error('[compare]', e);
+    return res.status(500).json({ ok: false, error: 'gpt_compare_failed' });
+  }
+});
+
+router.post('/feedback/compare', authMiddleware, async (req, res) => {
+  try {
+    const email = (req.user?.email || '').toLowerCase();
+    const isAdmin = email === 'admin@gmail.com';
+    if (!isAdmin) return res.status(403).json({ ok: false, error: 'forbidden' });
+
+    const { pairId, winner, variants } = req.body || {};
+    if (!pairId || !['left', 'right'].includes(winner)) {
+      return res.status(400).json({ ok: false, error: 'bad_params' });
+    }
+
+    await repo.saveCompareFeedback(req.user.uid, {
+      pairId,
+      winner,                       // 'left' | 'right'
+      variants: variants || null,   // { left:'A', right:'B' } (선택)
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[compare/feedback]', e);
+    return res.status(500).json({ ok: false, error: 'compare_feedback_failed' });
   }
 });
 

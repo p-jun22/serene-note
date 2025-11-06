@@ -24,23 +24,18 @@ function makeClientMessageId() {
   return `${Date.now().toString(36)}-${rand}`;
 }
 
-const EMOJI_MAP = {
-  행복: "😊", 기쁨: "😊", 즐거움: "😊", 만족: "🙂",
-  사랑: "🥰", 설렘: "🤩", 기대: "🤩",
-  평온: "😌", 안정: "😌", 중립: "😐",
-  불안: "😟", 걱정: "😟", 초조: "😟", 두려움: "😨", 공포: "😨",
-  슬픔: "😢", 우울: "😞", 상실: "😢",
-  분노: "😠", 짜증: "😠", 화: "😠",
-  수치심: "😳", 부끄러움: "😳",
-  피곤: "🥱", 지침: "🥱",
-};
-
 export default function ChatBot({ date, onBack }) {
   const dateKey = useMemo(() => ymdKST(date || new Date()), [date]);
 
   const [uidReady, setUidReady] = useState(false);
   const [userEmail, setUserEmail] = useState(null);
-  const isAdmin = (userEmail || "").toLowerCase() === "admin@gmail.com";
+  // 계정 => 모드 분기
+  const email = (userEmail || "").toLowerCase();
+  const BASELINE_EMAIL = "basic@gmail.com";
+  const ADMIN_EMAIL = "admin@gmail.com";
+  const isBaseline = email === BASELINE_EMAIL;
+  const isAdmin = email === ADMIN_EMAIL;
+  const mode = isBaseline ? "baseline" : (isAdmin ? "admin" : "user");
 
   const [convs, setConvs] = useState([]);
   const [activeId, setActiveId] = useState(null);
@@ -52,6 +47,21 @@ export default function ChatBot({ date, onBack }) {
   const [editingConvId, setEditingConvId] = useState(null);
   const [editTitle, setEditTitle] = useState("");
   const [editingMsgId, setEditingMsgId] = useState(null);
+
+  // 안전문구 감지(프론트 보조용) – 서버 저장 텍스트 기반
+  const SAFETY_RE = /이 앱은 당신의 안전|1393|109|1388|보건복지상담|자살예방상담/;
+
+  // 최근 user 메시지 텍스트(입력창이 비었을 때 A/B 입력으로 사용)
+  const lastUserText = React.useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m?.role === "user" && typeof m?.text === "string") {
+        const t = m.text.trim();
+        if (t) return t;
+      }
+    }
+    return "";
+  }, [messages]);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
@@ -154,57 +164,13 @@ export default function ChatBot({ date, onBack }) {
     const clientMessageId = makeClientMessageId();
 
     try {
-      const gptRes = await api.post("/gpt/analyze", {
+      await api.post("/gpt/analyze", {
         sessionId: dateKey,
         conversationId: convId,
         text: content,
         clientMessageId,
       });
-
-      const snap = gptRes?.data?.analysisSnapshot_v1 || {};
-      const out = snap?.llm?.output || {};
-      const isSafety = !!snap?.safety?.selfHarm;
-
-      const 감정 = Array.isArray(out["감정"]) ? out["감정"] : (Array.isArray(snap.emotions) ? snap.emotions : []);
-      const 왜곡 = Array.isArray(out["인지왜곡"]) ? out["인지왜곡"] : (Array.isArray(snap.distortions) ? snap.distortions : []);
-      const 핵심 = Array.isArray(snap.coreBeliefs) ? snap.coreBeliefs : (out["핵심믿음"] ? [out["핵심믿음"]] : []);
-      const 질문 = Array.isArray(snap.recommendedQuestions) ? snap.recommendedQuestions : (out["추천질문"] ? [out["추천질문"]] : []);
-      const conf = snap?.confidences || snap?.llm?.confidences || {};
-      let botText;
-      if (isSafety) {
-        //  안전 모드: 경고 문구만 (다른 섹션/점수/라벨 전부 숨김)
-        const crisis =
-          snap?.safety?.message ||
-          (Array.isArray(snap?.recommendedQuestions) ? snap.recommendedQuestions.join("\n") : "도움 요청 안내를 확인해 주세요.");
-        botText = crisis;
-      } else {
-        const llmLine =
-          conf && Object.keys(conf).length
-            ? `LLM 확신도 (감정/왜곡/핵심/질문): ${[
-              conf.emotions, conf.distortions, conf.coreBelief, conf.question,
-            ].map((v) => (typeof v === "number" ? v.toFixed(2) : "-")).join(" / ")}`
-            : "LLM 확신도: -";
-
-        botText = [
-          `[${dateKey}]`,
-          `감정: ${감정.join(", ")}`,
-          `인지 왜곡: ${왜곡.join(", ")}`,
-          `핵심 믿음: ${핵심.join(", ")}`,
-          `추천 질문: ${질문.join(", ")}`,
-          "",
-          "— 점수(분리 표시) —",
-          llmLine,
-          `HF emotions_avg / entropy: ${snap?.hf?.emotion?.avg ?? "-"} / ${snap?.hf?.emotion?.entropy ?? "-"}`,
-          `HF NLI entail / contradict: ${snap?.hf?.nli?.core?.entail ?? "-"} / ${snap?.hf?.nli?.core?.contradict ?? "-"}`,
-        ].join("\n");
-      }
-
-      await api.post("/messages", {
-        sessionId: dateKey,
-        conversationId: convId,
-        message: { role: "assistant", text: botText, correlationId: clientMessageId },
-      });
-
+      // 서버가 저장 끝냈으니 화면만 새로고침
       await loadConversations(false);
       await loadMessages(convId);
 
@@ -217,7 +183,99 @@ export default function ChatBot({ date, onBack }) {
     }
   };
 
-  // NEW: 피드백 전송을 Promise로 반환 → Message에서 await 가능
+  function ABCard({ result }) {
+    const text = result?.llm?.text?.trim();
+    const pretty = (() => {
+      try {
+        const o = result?.llm?.output;
+        if (!o) return "";
+        const emo = Array.isArray(o["감정"]) ? o["감정"].join(", ") : "";
+        const dist = Array.isArray(o["인지왜곡"]) ? o["인지왜곡"].join(", ") : "";
+        const core = o["핵심믿음"] || "";
+        const q = o["추천질문"] || "";
+        return [
+          emo && `• 감정: ${emo}`,
+          dist && `• 인지왜곡: ${dist}`,
+          core && `• 핵심믿음: ${core}`,
+          q && `• 추천질문: ${q}`,
+        ].filter(Boolean).join("\n");
+      } catch { return ""; }
+    })();
+    const fallback = JSON.stringify(result?.llm?.output ?? result, null, 2);
+    return <pre className="bubble" style={{ whiteSpace: 'pre-wrap' }}>{text || pretty || fallback}</pre>;
+  }
+
+  function ComparePanel({ isAdmin, inputText }) {
+    const [left, setLeft] = React.useState(null);
+    const [right, setRight] = React.useState(null);
+    const [pairId, setPairId] = React.useState(null);
+    const [busy, setBusy] = React.useState(false);
+    if (!isAdmin) return null;
+
+    const runCompare = async () => {
+      if (!inputText?.trim()) {
+        window.alert("입력창에 문장을 쓰거나, 직전 사용자 메시지가 있어야 비교를 생성할 수 있어요.");
+        return;
+      }
+      setBusy(true);
+      try {
+        const { data } = await api.post("/gpt/compare", {
+          text: inputText, variantA: "A", variantB: "B"
+        });
+        if (data?.ok) {
+          setPairId(data.pairId);
+          setLeft(data.left);
+          setRight(data.right);
+        } else {
+          window.alert(`비교 생성 실패: ${data?.error || "unknown"}`);
+        }
+      } catch (e) {
+        console.error("compare error:", e?.response?.data || e);
+        window.alert(`비교 생성 실패: ${e?.response?.data?.error || e.message}`);
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const submitWinner = async (side) => {
+      try {
+        await api.post("/feedback/compare", {
+          pairId, winner: side, variants: { left: "A", right: "B" }
+        });
+        setPairId(null); setLeft(null); setRight(null);
+      } catch (e) {
+        console.error("compare/feedback error:", e?.response?.data || e);
+        window.alert(`승자 저장 실패: ${e?.response?.data?.error || e.message}`);
+      }
+    };
+
+    return (
+      <div className="compare-panel">
+        <div className="ab-actions">
+          <button className="ab-btn" onClick={runCompare} disabled={busy}>
+            {busy ? "비교 생성 중…" : "비교 생성(A/B)"}
+          </button>
+        </div>
+
+        {left && right && (
+          <div className="compare-result">
+            <div className="compare-col">
+              <ABCard result={left} />
+              <button className="pick" disabled={!pairId || busy} onClick={() => submitWinner('left')}>⬅ 이쪽이 더 좋음</button>
+            </div>
+            <div className="compare-col">
+              <ABCard result={right} />
+              <button className="pick" disabled={!pairId || busy} onClick={() => submitWinner('right')}>이쪽이 더 좋음 ➡</button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+
+
+  // 피드백 전송을 Promise로 반환 => Message에서 await 가능
   const handleRateMessage = async (messageId, score) => {
     if (!activeId || !dateKey || !messageId) return Promise.resolve(false);
     try {
@@ -231,7 +289,7 @@ export default function ChatBot({ date, onBack }) {
     } catch (e) {
       console.error("피드백 전송 실패:", e?.response?.data || e);
       window.alert("피드백 전송에 실패했습니다.");
-      throw e; // 실패로 알려줌
+      throw e; // 실패
     }
   };
 
@@ -292,6 +350,26 @@ export default function ChatBot({ date, onBack }) {
           <div className="title">{headerTitle}</div>
           {onBack && <button className="btn" onClick={onBack}>◀ 캘린더로</button>}
         </div>
+        {/* 배지: 안전모드 우선 표시 => 아니면 Stage-1/2 */}
+        {(() => {
+          const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant');
+          const looksSafety = lastAssistant ? SAFETY_RE.test(lastAssistant.text || '') : false;
+          const userTurns = messages.filter(m => m.role === 'user').length;
+          const isCoaching = !isBaseline && userTurns >= 2;
+          const badgeText = looksSafety ? '안전 안내 모드' : (isCoaching ? '코칭 모드(Stage-2)' : '요약 모드(Stage-1)');
+          const badgeStyle = looksSafety
+            ? { background: '#fff7e6', border: '1px solid #ffd591' }
+            : (isCoaching ? { background: '#e6f7ff', border: '1px solid #91d5ff' } : { background: '#f6ffed', border: '1px solid #b7eb8f' });
+          return (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '4px 0 8px' }}>
+              <span style={{ fontSize: 12, padding: '2px 6px', borderRadius: 12, color: '#555', ...badgeStyle }}>
+                {badgeText}
+              </span>
+            </div>
+          );
+        })()}
+        <ComparePanel isAdmin={isAdmin} inputText={input || lastUserText} />
+
 
         <div className="chat-box">
           {messages.map((m) => (
@@ -300,7 +378,10 @@ export default function ChatBot({ date, onBack }) {
               id={m.id}
               role={m.role}
               text={m.text}
+              mode={mode}
               editingId={editingMsgId}
+              // 안전문구일 때(admin x) 강제로 숨김
+              forceHideFeedback={!isAdmin && m.role === 'assistant' && SAFETY_RE.test(m.text || '')}
               onStartEdit={m.role === 'assistant' ? undefined : (id) => setEditingMsgId(id)}
               onCancelEdit={() => setEditingMsgId(null)}
               onSaveEdit={async (mid, newText) => {
@@ -314,7 +395,7 @@ export default function ChatBot({ date, onBack }) {
                 }
               }}
               isAdmin={isAdmin}
-              onRate={handleRateMessage} // NEW: Promise 반환
+              onRate={handleRateMessage}
             />
           ))}
         </div>

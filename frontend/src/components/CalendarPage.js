@@ -1,9 +1,7 @@
 // src/components/CalendarPage.js
-// - App.css가 기대하는 레이아웃 클래스 적용:
-//   .page.page-calendar > .calendar-wrap > .toolbar + <Container />
 // - 날짜 클릭 시 즉시 onWrite(dateKey) 호출(모달/기록보기 없음: 최신 정책).
 // - /api/calendar 응답은 { data: { "YYYY-MM-DD": {...} } } 형태를 우선 사용하되
-//   일부 구버전/테스트 응답에 대응하기 위해 배열 -> 객체 매핑을 보강함.
+//   일부 구버전/테스트 응답에 대응하기 위해 배열 => 객체 매핑을 보강함.
 
 import React, { useEffect, useMemo, useState } from "react";
 import Container from "./Container";

@@ -1,20 +1,9 @@
 // src/components/AccuracyAnalysis.js
-// ─────────────────────────────────────────────────────────────────────────────
-// [역할]
-// - 날짜 범위: 메시지 단위 확신도/보조지표를 날짜별 평균으로 시각화
-// - 진행(대화 순번): 선택 날짜의 대화들을 생성순으로 정렬한 뒤 1..N 순번에 따른 평균 지표 변화 시각화
-//
-// [원칙]
-// - 조회 전용(쓰기 없음). 엔드포인트/스키마 변경 없음.
-// - LLM 확신도: snapshot.llm.confidences 우선, 없으면 snapshot.confidences 허용
-// - HF 지표: snapshot.hf.* 우선, 없으면 m.hf_raw.* fallback 허용
-// - 발표용: HF를 메인으로 먼저 노출, 상태/커버리지 배지 제공, 콘솔 로그 제거
-// ─────────────────────────────────────────────────────────────────────────────
 
 import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api';
 
-/* ───── 날짜 유틸 ───── */
+// 날짜 유틸
 function ymdKST(d) {
   if (!(d instanceof Date)) d = new Date(d);
   return new Intl.DateTimeFormat('en-CA', {
@@ -29,9 +18,156 @@ function rangeDays(startKey, endKey) {
   }
   return out;
 }
-function mean(arr) { const xs = (arr || []).filter(v => Number.isFinite(v)); return xs.length ? xs.reduce((a,b)=>a+b,0)/xs.length : null; }
+function mean(arr) { const xs = (arr || []).filter(v => Number.isFinite(v)); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; }
 
-/* ───── 아주 가벼운 SVG 라인차트(의존성 X) ───── */
+
+function CalibrationCard({ url, splitNote = '학습:평가 ≈ 66.7%와 33.3% (admin+asdf(어드민+일반유저1) vs qwer(일반유저2))' }) {
+  const [data, setData] = React.useState(null);
+  const [err, setErr] = React.useState(null);
+
+  React.useEffect(() => {
+    let alive = true;
+    setErr(null);
+    fetch(url)
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(r.statusText))))
+      .then(j => { if (alive) setData(j); })
+      .catch(e => { if (alive) setErr(e); });
+    return () => { alive = false; };
+  }, [url]);
+
+  if (err) {
+    return (
+      <div className="card" style={{ padding: 12, marginBottom: 12 }}>
+        <div style={{ fontWeight: 600 }}>홀드아웃 캘리브레이션</div>
+        <div className="warn">결과 파일을 찾지 못했습니다: {url}</div>
+      </div>
+    );
+  }
+  if (!data) {
+    return (
+      <div className="card" style={{ padding: 12, marginBottom: 12 }}>
+        <div style={{ fontWeight: 600 }}>홀드아웃 캘리브레이션</div>
+        <div className="muted">결과를 불러오는 중…</div>
+      </div>
+    );
+  }
+
+  const b0 = data?.base?.brier ?? null, b1 = data?.calibrated?.brier ?? null;
+  const e0 = data?.base?.ece ?? null, e1 = data?.calibrated?.ece ?? null;
+  const dB = (b1 - b0), dE = (e1 - e0);
+
+  const BAR_H = 120, BAR_W = 28, BAR_GAP = 12;
+  // 하나의 막대 트랙(흰 배경 + 둥근 모서리 + overflow hidden)
+  function Track({ fillPx, opacity }) {
+    return (
+      <div
+        style={{
+          position: 'relative',
+          width: BAR_W,
+          height: BAR_H,
+          background: '#fff',                           // <- 남은 영역이 흰색으로 보이는 부분
+          borderRadius: 6,
+          overflow: 'hidden',
+          boxShadow: 'inset 0 0 0 1px rgba(0,0,0,.06)', // 살짝 테두리
+        }}
+      >
+        <div
+          style={{
+            position: 'absolute',
+            left: 0, right: 0, bottom: 0,
+            height: `${Math.max(0, fillPx)}px`,           // 아래에서 위로 채움
+            background: 'currentColor',
+            opacity,
+          }}
+        />
+      </div>
+    );
+  }
+
+  const BarPair = ({ before, after }) => {
+    const clamp01 = v => Math.max(0, Math.min(1, Number(v)));
+    const h0 = clamp01(before) * BAR_H;
+    const h1 = clamp01(after) * BAR_H;
+
+    return (
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: `${BAR_W}px ${BAR_W}px`,
+          columnGap: BAR_GAP,
+          alignItems: 'end',
+        }}
+      >
+        <Track fillPx={h0} opacity={0.25} />
+        <Track fillPx={h1} opacity={0.85} />
+      </div>
+    );
+  };
+
+  const Row = ({ label, before, after, delta }) => (
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: '140px 120px 72px', // [라벨][막대][델타]
+        alignItems: 'end',
+        gap: 12,
+        marginBottom: 10,
+        backgroundColor: 'var(--peach-200)',
+        borderRadius: 12,
+        padding: '8px 12px',
+        marginLeft: 140
+      }}
+    >
+      <div>{label} <span className="muted">(전/후)</span></div>
+      <BarPair before={before} after={after} />
+      <div
+        style={{
+          textAlign: 'right',
+          fontVariantNumeric: 'tabular-nums',
+          color: delta < 0 ? 'var(--ok)' : 'var(--warn)'
+        }}
+      >
+        {Number.isFinite(delta) ? delta.toFixed(4) : '-'}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="card" style={{ padding: 12, marginBottom: 12 }}>
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>
+        홀드아웃 캘리브레이션 (UID: {data.uid})
+      </div>
+      <div className="muted" style={{ marginBottom: 8, lineHeight: 1.3 }}>
+        기간 {new Date(data.window.from).toLocaleDateString()} ~ {new Date(data.window.to).toLocaleDateString()} ·
+        표본 n={data.n} (양성 {data.positives}) · 모델 {data.calibrated.type} ·
+        학습:평가 ≈ 66.7%와 33.3% (admin+일반유저1 vs qwer일반유저2)
+      </div>
+
+      {/* 범례를 라벨 열과 정렬되게 배치 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, margin: '0 0 6px 140px' }}>
+        <span className="muted" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 12, height: 12, background: 'currentColor', opacity: .25, borderRadius: 2 }} />
+          전(before)
+        </span>
+        <span className="muted" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 12, height: 12, background: 'currentColor', opacity: .85, borderRadius: 2 }} />
+          후(after)
+        </span>
+      </div>
+
+      <div style={{ display: 'grid', gap: 10, marginBottom: 6, justifyContent: 'start' }}>
+        <Row label="Brier" before={b0} after={b1} delta={dB} />
+        <Row label="ECE" before={e0} after={e1} delta={dE} />
+      </div>
+
+      <div className="muted" style={{ marginLeft: 140 }}>
+        임계·게이트는 <b>원본 p</b> 사용, 확률 표시는 <b>보정 q</b> 사용 권장.
+      </div>
+    </div>
+  );
+}
+
+// SVG 라인차트
 function LineChart({ title, data, height = 160 }) {
   const padding = 32;
   const width = Math.max(360, Math.min(900, (data?.length || 1) * 42));
@@ -75,7 +211,7 @@ function LineChart({ title, data, height = 160 }) {
         {xs.map((p, i) => {
           const x = padding + (xs.length <= 1 ? innerW / 2 : (i / (xs.length - 1)) * innerW);
           const label = String(p?.x ?? '').slice(5);
-          return <text key={i} x={x} y={height - padding + 14} textAnchor="middle" fontSize="10">{label || (i+1)}</text>;
+          return <text key={i} x={x} y={height - padding + 14} textAnchor="middle" fontSize="10">{label || (i + 1)}</text>;
         })}
         {d && <path d={d} fill="none" stroke="currentColor" strokeWidth="2" opacity="0.9" />}
         {points.map((pt, i) => (pt.y == null ? null : <circle key={i} cx={pt.x} cy={pt.y} r="3" fill="currentColor" />))}
@@ -84,7 +220,9 @@ function LineChart({ title, data, height = 160 }) {
   );
 }
 
-/* ───── 메인 컴포넌트 ───── */
+// =========================================================================
+// 메인 컴포넌트
+// =========================================================================
 export default function AccuracyAnalysis() {
   // 탭: 'date' | 'progress'
   const [tab, setTab] = useState('date');
@@ -105,15 +243,15 @@ export default function AccuracyAnalysis() {
   });
   const [progressRows, setProgressRows] = useState([]); // 순번 분석 결과
 
-  /* ──────────────────────────────────────────────────────────────────────────
-   * [A] 날짜 범위 평균
-   * ────────────────────────────────────────────────────────────────────────── */
+  // =========================================================================
+  // 날짜 범위 평균
+  // =========================================================================
   useEffect(() => {
     if (tab !== 'date') return;
     (async () => {
       setLoading(true);
       try {
-        // 1) 달력 → convSet
+        // 달력 → convSet
         const calRes = await api.get('/calendar', { params: { startDateKey: startDate, endDateKey: endDate } });
         const byDate = calRes?.data?.data || {};
         const dates = rangeDays(startDate, endDate);
@@ -124,7 +262,7 @@ export default function AccuracyAnalysis() {
           const convIds = Object.keys(byDate?.[dateKey]?.convSet || {});
           if (!convIds.length) { out.push({ dateKey, metrics: {} }); continue; }
 
-          // 2) 각 대화 메시지(유저만) 수집 → 확신도/보조지표 평균
+          // 각 대화 메시지(유저만) 수집 → 확신도/보조지표 평균
           const metrics = {
             llm_emotions: [], llm_distortions: [], llm_coreBelief: [], llm_question: [],
             hf_emotions_avg: [], hf_emotion_entropy: [], hf_core_entail: [], hf_core_contradict: []
@@ -145,10 +283,10 @@ export default function AccuracyAnalysis() {
 
               const snap = m?.analysisSnapshot_v1 || {};
               const llmConf = snap?.llm?.confidences || snap?.confidences || {};
-              if (Number.isFinite(llmConf.emotions))    metrics.llm_emotions.push(llmConf.emotions);
+              if (Number.isFinite(llmConf.emotions)) metrics.llm_emotions.push(llmConf.emotions);
               if (Number.isFinite(llmConf.distortions)) metrics.llm_distortions.push(llmConf.distortions);
-              if (Number.isFinite(llmConf.coreBelief))  metrics.llm_coreBelief.push(llmConf.coreBelief);
-              if (Number.isFinite(llmConf.question))    metrics.llm_question.push(llmConf.question);
+              if (Number.isFinite(llmConf.coreBelief)) metrics.llm_coreBelief.push(llmConf.coreBelief);
+              if (Number.isFinite(llmConf.question)) metrics.llm_question.push(llmConf.question);
 
               let hasHF = false;
               const hfBlock = snap?.hf || null;
@@ -209,9 +347,9 @@ export default function AccuracyAnalysis() {
     };
   }, [rows]);
 
-  /* ──────────────────────────────────────────────────────────────────────────
-   * [B] 진행(대화 순번) 분석
-   * ────────────────────────────────────────────────────────────────────────── */
+  // =========================================================================
+  // 진행(대화 순번) 분석
+  // =========================================================================
   useEffect(() => {
     if (tab !== 'progress') return;
     (async () => {
@@ -223,37 +361,37 @@ export default function AccuracyAnalysis() {
         const convIds = Object.keys(convSet);
         if (!convIds.length) { setProgressRows([]); setLoading(false); return; }
 
-        // 2) 각 대화의 createdAt 기준으로 정렬(1..N 순번)
+        // 각 대화의 createdAt 기준으로 정렬
         const convMetas = await Promise.all(
           convIds.map(async (cid) => {
             const conv = await api.get(`/conversations/${cid}`, { params: { sessionId: focusDate } })
-              .then(r => r?.data?.data || null).catch(()=>null);
+              .then(r => r?.data?.data || null).catch(() => null);
             return { id: cid, createdAt: conv?.createdAt?._seconds || 0 };
           })
         );
-        convMetas.sort((a,b)=> (a.createdAt||0) - (b.createdAt||0));
+        convMetas.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
 
-        // 3) 각 대화별 유저 메시지 수집 → 평균 지표 계산
-        const seqMetrics = []; // [{ idx:1, metrics:{...} }, ...]
-        for (let i=0; i<convMetas.length; i++){
+        // 각 대화별 유저 메시지 수집 → 평균 지표 계산
+        const seqMetrics = [];
+        for (let i = 0; i < convMetas.length; i++) {
           const cid = convMetas[i].id;
           const msgs = await api.get(`/conversations/${cid}/messages`, { params: { sessionId: focusDate, limit: 1000 } })
             .then(r => r?.data?.data || [])
-            .catch(()=>[]);
+            .catch(() => []);
 
           const bucket = {
             llm_emotions: [], llm_distortions: [], llm_coreBelief: [], llm_question: [],
             hf_emotions_avg: [], hf_emotion_entropy: [], hf_core_entail: [], hf_core_contradict: []
           };
 
-          for (const m of msgs){
+          for (const m of msgs) {
             if (m.role !== 'user') continue;
             const snap = m?.analysisSnapshot_v1 || {};
             const llmConf = snap?.llm?.confidences || snap?.confidences || {};
-            if (Number.isFinite(llmConf.emotions))    bucket.llm_emotions.push(llmConf.emotions);
+            if (Number.isFinite(llmConf.emotions)) bucket.llm_emotions.push(llmConf.emotions);
             if (Number.isFinite(llmConf.distortions)) bucket.llm_distortions.push(llmConf.distortions);
-            if (Number.isFinite(llmConf.coreBelief))  bucket.llm_coreBelief.push(llmConf.coreBelief);
-            if (Number.isFinite(llmConf.question))    bucket.llm_question.push(llmConf.question);
+            if (Number.isFinite(llmConf.coreBelief)) bucket.llm_coreBelief.push(llmConf.coreBelief);
+            if (Number.isFinite(llmConf.question)) bucket.llm_question.push(llmConf.question);
 
             const hfBlock = snap?.hf || null;
             if (hfBlock) {
@@ -279,7 +417,7 @@ export default function AccuracyAnalysis() {
           }
 
           const avg = Object.fromEntries(Object.entries(bucket).map(([k, arr]) => [k, mean(arr)]));
-          seqMetrics.push({ idx: i+1, metrics: avg });
+          seqMetrics.push({ idx: i + 1, metrics: avg });
         }
 
         setProgressRows(seqMetrics);
@@ -308,16 +446,18 @@ export default function AccuracyAnalysis() {
       llm_question: toSeries('llm_question'),
     };
   }, [progressRows]);
-
-  /* ───── 렌더 ───── */
+  
+  // =========================================================================
+  // 렌더
+  // =========================================================================
   return (
     <div className="page-wrap" style={{ padding: 16 }}>
       {/* 탭 / 컨트롤 */}
       <div className="toolbar" style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
         <div style={{ fontWeight: 700, fontSize: 18 }}>정확도 분석</div>
         <div style={{ display: 'flex', gap: 6, marginLeft: 8 }}>
-          <button className={`btn ${tab==='date'?'primary':''}`} onClick={()=>setTab('date')}>날짜별 평균</button>
-          <button className={`btn ${tab==='progress'?'primary':''}`} onClick={()=>setTab('progress')}>진행(대화 순번)</button>
+          <button className={`btn ${tab === 'date' ? 'primary' : ''}`} onClick={() => setTab('date')}>날짜별 평균</button>
+          <button className={`btn ${tab === 'progress' ? 'primary' : ''}`} onClick={() => setTab('progress')}>진행(대화 순번)</button>
         </div>
         <div style={{ flex: 1 }} />
 
@@ -327,7 +467,7 @@ export default function AccuracyAnalysis() {
             <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
             <label className="muted" style={{ fontSize: 12 }}>종료</label>
             <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
-            <span className={`chip ${coverage.hfMsgs>0?'good':'warn'}`} title="HF 지표가 있는 유저 메시지 수 / 전체 유저 메시지 수">
+            <span className={`chip ${coverage.hfMsgs > 0 ? 'good' : 'warn'}`} title="HF 지표가 있는 유저 메시지 수 / 전체 유저 메시지 수">
               HF 커버리지: {coverage.hfMsgs}/{coverage.userMsgs}
             </span>
             <span className="chip" title="선택된 날짜 수">일수: {coverage.days}</span>
@@ -346,6 +486,7 @@ export default function AccuracyAnalysis() {
 
       {!loading && tab === 'date' && (
         <>
+          <CalibrationCard url="/results/qwer_holdout_v1.json" />
           {/* HF 먼저(메인) */}
           <LineChart title="HF: emotions_avg (날짜별 평균)" data={series.hf_emotions_avg} />
           <LineChart title="HF: emotion_entropy (날짜별 평균)" data={series.hf_emotion_entropy} />

@@ -50,6 +50,16 @@ const clip01 = (x) => {
 };
 const coldStartCap = (x) => Math.min(clip01(x), 0.85);
 
+function toStrArray(x, { max = Infinity, dedup = true } = {}) {
+  let arr = [];
+  if (Array.isArray(x)) arr = x;
+  else if (typeof x === 'string') arr = [x];
+  arr = arr.map(s => (typeof s === 'string' ? s.trim() : '')).filter(Boolean);
+  if (dedup) { const seen = new Set(); arr = arr.filter(s => (seen.has(s) ? false : (seen.add(s), true))); }
+  if (Number.isFinite(max)) arr = arr.slice(0, max);
+  return arr;
+}
+
 // 이모지 매핑
 const EMOJI = {
   행복: '😊', 기쁨: '😊', 즐거움: '😊', 만족: '🙂',
@@ -127,15 +137,15 @@ function buildSystemPromptStage1({ coaching = false }) {
     '입력 텍스트에서 다음을 **JSON 객체**로만 출력하라(추가 텍스트/코드블록 금지).',
     '- "감정": 문자열 배열',
     '- "인지왜곡": 문자열 배열',
-    '- "핵심믿음": 문자열(없으면 빈 문자열)',
-    '- "추천질문": 문자열(없으면 빈 문자열)',
+    '- "핵심믿음": 문자열 배열',
+    '※ "핵심믿음"은 반드시 한 문장으로 추출하라. 비어 있거나 모호하면 사용자의 서술에서 가장 중심이 되는 신념을 한 문장으로 재진술하라. (기본 1개, 불가피한 경우에만 2개)',
+    '- "추천질문": 문자열 배열',
     '- "confidences": { "emotions":0..1, "distortions":0..1, "coreBelief":0..1, "question":0..1 }',
     '',
     '※ carryover 규칙:',
     '- 이전 메시지 분석(prev)이 함께 주어질 수 있다.',
-    '- 현재 입력이 매우 짧거나 메타 성격(예: “어떻게 했어야 했을까?”)으로 새 근거가 없으면,',
-    '  prev의 라벨을 유지하되 확실히 갱신 가능한 항목만 신중히 갱신한다.',
-    '- 결과 JSON에서 어떤 항목이 비었으면 prev의 값을 보완하되, "추천질문"은 반드시 현재 입력을 기준으로 생성한다.'
+    '- 현재 입력이 매우 짧거나 메타 성격(예: “어떻게 했어야 했을까?”)으로 새 근거가 없으면, prev의 라벨을 유지하되 확실히 갱신 가능한 항목만 신중히 갱신한다.',
+    '- 결과 JSON에서 어떤 항목이 비었으면 prev의 값을 보완하되, "추천질문"은 반드시 현재 입력을 기준으로 새로 생성한다.'
   ];
 
   if (coaching) {
@@ -166,8 +176,9 @@ async function openaiChat(payload) {
   return resp.data?.choices?.[0]?.message?.content ?? '';
 }
 
-async function runStage1({ mode, userText, enableCoaching, prev = null }) {
+async function runStage1({ mode, userText, enableCoaching, prev = null, promptOverride = null }) {
   const temp = (mode === 'baseline') ? 1.0 : 0.2;  // baseline=1.0, admin/user=0.2
+
   // DEMO 스텁
   if (DEMO) {
     // baseline: "순정에 가깝되" 출력만 JSON 강제
@@ -177,8 +188,8 @@ async function runStage1({ mode, userText, enableCoaching, prev = null }) {
         '아래 항목만 **JSON 객체**로 출력하라(설명/코드블록 금지).',
         '- "감정": 문자열 배열',
         '- "인지왜곡": 문자열 배열',
-        '- "핵심믿음": 문자열(없으면 빈 문자열)',
-        '- "추천질문": 문자열(없으면 빈 문자열)'
+        '- "핵심믿음": 문자열 배열',
+        '- "추천질문": 문자열 배열'
       ].join('\n');
 
       const raw = await openaiChat({
@@ -193,12 +204,14 @@ async function runStage1({ mode, userText, enableCoaching, prev = null }) {
 
       let parsed = {};
       try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+      // DEMO baseline 표준화(out 만드는 부분)
       const out = {
-        '감정': Array.isArray(parsed['감정']) ? parsed['감정'] : [],
-        '인지왜곡': Array.isArray(parsed['인지왜곡']) ? parsed['인지왜곡'] : [],
-        '핵심믿음': typeof parsed['핵심믿음'] === 'string' ? parsed['핵심믿음'] : '',
-        '추천질문': typeof parsed['추천질문'] === 'string' ? parsed['추천질문'] : ''
+        '감정': toStrArray(parsed['감정'], { max: 4 }),
+        '인지왜곡': toStrArray(parsed['인지왜곡'], { max: 4 }),
+        '핵심믿음': toStrArray(parsed['핵심믿음'], { max: 2 }),
+        '추천질문': toStrArray(parsed['추천질문'], { max: 3 })
       };
+
       return {
         llm: { text: '', output: out, confidences: {} },
         parsed: out
@@ -219,7 +232,7 @@ async function runStage1({ mode, userText, enableCoaching, prev = null }) {
   }
 
   // admin/user: JSON Mode
-  const sys = buildSystemPromptStage1({ coaching: !!enableCoaching });
+  const sys = promptOverride || buildSystemPromptStage1({ coaching: enableCoaching });
 
   // prev를 간단 요약으로 축약해 함께 전달
   const prevCtx = prev ? {
@@ -247,12 +260,12 @@ async function runStage1({ mode, userText, enableCoaching, prev = null }) {
     parsed = m ? JSON.parse(m[0]) : {};
   }
 
-  // 표준화
+  // ▼ JSON 파싱 후: 표준화(문자열/배열 모두 수용)
   const out = {
-    '감정': Array.isArray(parsed['감정']) ? parsed['감정'] : [],
-    '인지왜곡': Array.isArray(parsed['인지왜곡']) ? parsed['인지왜곡'] : [],
-    '핵심믿음': typeof parsed['핵심믿음'] === 'string' ? parsed['핵심믿음'] : '',
-    '추천질문': typeof parsed['추천질문'] === 'string' ? parsed['추천질문'] : '',
+    '감정': toStrArray(parsed['감정'], { max: 4 }),
+    '인지왜곡': toStrArray(parsed['인지왜곡'], { max: 4 }),
+    '핵심믿음': toStrArray(parsed['핵심믿음'], { max: 2 }),   // 기본 1개, 최대 2개
+    '추천질문': toStrArray(parsed['추천질문'], { max: 3 }),
     'confidences': {
       emotions: clip01(parsed?.confidences?.emotions ?? 0.6),
       distortions: clip01(parsed?.confidences?.distortions ?? 0.5),
@@ -261,22 +274,24 @@ async function runStage1({ mode, userText, enableCoaching, prev = null }) {
     }
   };
 
-  // carryover: 결과가 비면 prev로 보완
+  // ▼ carryover: 결과가 비면 prev로 보완(배열 기준)
   if (prev) {
-    if ((!out['감정'] || out['감정'].length === 0) && Array.isArray(prev.emotions) && prev.emotions.length) {
+    if (!out['감정'].length && Array.isArray(prev.emotions) && prev.emotions.length) {
       out['감정'] = [...prev.emotions];
       if (out.confidences.emotions == null) out.confidences.emotions = 0.6;
     }
-    if ((!out['인지왜곡'] || out['인지왜곡'].length === 0) && Array.isArray(prev.distortions) && prev.distortions.length) {
+    if (!out['인지왜곡'].length && Array.isArray(prev.distortions) && prev.distortions.length) {
       out['인지왜곡'] = [...prev.distortions];
       if (out.confidences.distortions == null) out.confidences.distortions = 0.6;
     }
-    if (!out['핵심믿음'] || !out['핵심믿음'].trim()) {
+    if (!out['핵심믿음'].length) {
       const cb = Array.isArray(prev.coreBeliefs) ? prev.coreBeliefs[0] : (prev.coreBelief || '');
-      out['핵심믿음'] = cb || '';
-      if (out.confidences.coreBelief == null && cb) out.confidences.coreBelief = 0.6;
+      if (cb) {
+        out['핵심믿음'] = [cb];
+        if (out.confidences.coreBelief == null) out.confidences.coreBelief = 0.6;
+      }
     }
-    // "추천질문"은 비어있더라도 굳이 prev로 채우지 않음(현재 입력 기준 생성이 원칙)
+    // "추천질문"은 항상 현재 입력 기준 → prev로 채우지 않음
   }
 
   return {
@@ -297,7 +312,7 @@ async function runHFSignals({ userText, emotions, coreBelief }) {
       emotions: Array.isArray(emotions) ? emotions : [],
       coreBelief: typeof coreBelief === 'string' ? coreBelief : ''
     };
-    const r = await axios.post(`${HF_BASE}/scores`, payload, { timeout: 30000 });
+    const r = await axios.post(`${HF_BASE}/scores?segment=true`, payload, { timeout: 30000 });
     return r.data || null;
   } catch (_e) {
     return null;
@@ -387,6 +402,7 @@ async function analyzeMessage({
   enableCorrection = true,       // 1번째부터 ±교정 적용(baseline 제외)
   safetyOn = false,              // 일반 사용자만 ON
   prevSnapshot = null,            // 직전 스냅샷(있다면 carryover용)
+  promptOverride = null,
 }) {
   // 0) Safety gate (자해/위험 신호 → Stage-1 우회 & 즉시 리턴)
   if (safetyOn && detectSelfHarmKo(userText)) {
@@ -417,14 +433,15 @@ async function analyzeMessage({
   }
 
   // 1) Stage-1
-  const s1 = await runStage1({ mode, userText, enableCoaching, prev: prevSnapshot });
+  const s1 = await runStage1({ mode, userText, enableCoaching, prev: prevSnapshot, promptOverride });
   const llm = s1.llm;
   const p = s1.parsed || {};
 
-  const emotions = Array.isArray(p['감정']) ? p['감정'] : [];
-  const distortions = Array.isArray(p['인지왜곡']) ? p['인지왜곡'] : [];
-  const coreBelief = typeof p['핵심믿음'] === 'string' ? p['핵심믿음'] : '';
-  const question1 = typeof p['추천질문'] === 'string' ? p['추천질문'] : '';
+  const emotionsArr = toStrArray(p['감정'], { max: 4 });
+  const distortionsArr = toStrArray(p['인지왜곡'], { max: 4 });
+  const coreBeliefsArr = toStrArray(p['핵심믿음'], { max: 2 });
+  const questionsArr = toStrArray(p['추천질문'], { max: 3 });
+  const primaryCoreBelief = coreBeliefsArr[0] || '';
   const llmConf = {
     emotions: clip01(p?.confidences?.emotions ?? 0.5),
     distortions: clip01(p?.confidences?.distortions ?? 0.5),
@@ -433,7 +450,7 @@ async function analyzeMessage({
   };
 
   // 2) HF 신호
-  const hfResp = await runHFSignals({ userText, emotions, coreBelief });
+  const hfResp = await runHFSignals({ userText, emotions: emotionsArr, coreBelief: primaryCoreBelief });
   const hf = hfResp ? {
     emotion: { avg: clip01(hfResp?.emotions_avg ?? hfResp?.hf_raw?.emotion?.avg), entropy: clip01(hfResp?.emotion_entropy ?? hfResp?.hf_raw?.emotion?.entropy) },
     nli: { core: { entail: clip01(hfResp?.nli_core?.entail ?? hfResp?.hf_raw?.nli_core?.entail), contradict: clip01(hfResp?.nli_core?.contradict ?? hfResp?.hf_raw?.nli_core?.contradict) } }
@@ -448,11 +465,11 @@ async function analyzeMessage({
     const _final_raw = clip01((conf_emotions + conf_distort + conf_coreBelief) / 3);
 
     const snapshot = {
-      emotions,
-      distortions,
-      coreBeliefs: coreBelief ? [coreBelief] : [],
-      recommendedQuestions: question1 ? [question1] : [],
-      emoji: pickEmojiFromLabels(emotions),
+      emotions: emotionsArr,
+      distortions: distortionsArr,
+      coreBeliefs: coreBeliefsArr,
+      recommendedQuestions: questionsArr,
+      emoji: pickEmojiFromLabels(emotionsArr),
       confidences: { emotions: conf_emotions, distortions: conf_distort, coreBelief: conf_coreBelief, question: conf_question, _final_raw },
       ...(hf ? { hf } : {}),
       llm: { text: llm.text || '', output: llm.output || p, confidences: {} },
@@ -476,6 +493,16 @@ async function analyzeMessage({
     conf.coreBelief = corr.coreBelief;
     conf.question = corr.question;
   }
+
+  // 4-2.5) HF-게이팅: HF 신호가 약할수록 LLM 감정확신을 부드럽게 수축
+if (hf && typeof hf?.emotion?.entropy === 'number') { 
+  const hfConfEmo = clip01(1 - hf.emotion.entropy);           // 0..1
+  const gate = Math.max(0.2, Math.min(1.0, 4 * hfConfEmo));   // 신호 약할수록 작아짐(바닥 0.2)
+  conf.emotions = clip01((conf.emotions ?? 0) * gate);
+  if (llmConf && typeof llmConf.emotions === 'number') {
+    llmConf.emotions = conf.emotions; // 요약 카드 표기도 정렬
+  }
+}
 
   // 4-3) HF-우선 결합으로 _final_raw 생성
   //   emotions ≈ 1 - entropy, core ≈ max(0, entail-contradict), distort ≈ conf.distortions(소폭 조정)
@@ -504,14 +531,14 @@ async function analyzeMessage({
   const final_capped = coldStartCap(_final_raw);
 
   // 5) 스냅샷 조립 — 코칭 단계는 이모지 저장 생략
-  const emojiValue = enableCoaching ? undefined : pickEmojiFromLabels(emotions);
+  const emojiValue = enableCoaching ? undefined : pickEmojiFromLabels(emotionsArr);
 
   const snapshot = {
-    emotions,
-    distortions,
-    coreBeliefs: coreBelief ? [coreBelief] : [],
-    recommendedQuestions: question1 ? [question1] : [],
-    ...(emojiValue ? { emoji: emojiValue } : {}),  // ← 조건부 저장
+    emotions: emotionsArr,
+    distortions: distortionsArr,
+    coreBeliefs: coreBeliefsArr,
+    recommendedQuestions: questionsArr,
+    ...(emojiValue ? { emoji: emojiValue } : {}),
     ...(hf ? { hf } : {}),
     llm: {
       text: llm.text || '',
@@ -548,11 +575,15 @@ async function analyzeMessage({
 // (선택) 외부에서 직접 Stage-1+HF만 필요할 때 사용하는 헬퍼
 async function analyzeWithLLMAndHF(userText) {
   const { llm, parsed } = await runStage1({ mode: 'user', userText, enableCoaching: false });
-  const hf_raw = await runHFSignals({ userText, emotions: parsed['감정'], coreBelief: parsed['핵심믿음'] });
-  const emotions = Array.isArray(parsed['감정']) ? parsed['감정'] : [];
-  const distortions = Array.isArray(parsed['인지왜곡']) ? parsed['인지왜곡'] : [];
-  const coreBelief = parsed['핵심믿음'] ? [parsed['핵심믿음']] : [];
-  const questions = parsed['추천질문'] ? [parsed['추천질문']] : [];
+
+  const emotions = toStrArray(parsed['감정'], { max: 4 });
+  const distortions = toStrArray(parsed['인지왜곡'], { max: 4 });
+  const coreBeliefs = toStrArray(parsed['핵심믿음'], { max: 2 });
+  const questions = toStrArray(parsed['추천질문'], { max: 3 });
+  const primaryCoreBelief = coreBeliefs[0] || '';
+
+  const hf_raw = await runHFSignals({ userText, emotions, coreBelief: primaryCoreBelief });
+
   const llmConf = {
     emotions: clip01(parsed?.confidences?.emotions ?? 0.5),
     distortions: clip01(parsed?.confidences?.distortions ?? 0.5),
@@ -560,13 +591,24 @@ async function analyzeWithLLMAndHF(userText) {
     question: clip01(parsed?.confidences?.question ?? 0.5),
   };
   const hf = hf_raw ? {
-    emotion: { avg: clip01(hf_raw?.emotions_avg ?? hf_raw?.hf_raw?.emotion?.avg), entropy: clip01(hf_raw?.emotion_entropy ?? hf_raw?.hf_raw?.emotion?.entropy) },
-    nli: { core: { entail: clip01(hf_raw?.nli_core?.entail ?? hf_raw?.hf_raw?.nli_core?.entail), contradict: clip01(hf_raw?.nli_core?.contradict ?? hf_raw?.hf_raw?.nli_core?.contradict) } }
+    emotion: {
+      avg: clip01(hf_raw?.emotions_avg ?? hf_raw?.hf_raw?.emotion?.avg),
+      entropy: clip01(hf_raw?.emotion_entropy ?? hf_raw?.hf_raw?.emotion?.entropy)
+    },
+    nli: {
+      core: {
+        entail: clip01(hf_raw?.nli_core?.entail ?? hf_raw?.hf_raw?.nli_core?.entail),
+        contradict: clip01(hf_raw?.nli_core?.contradict ?? hf_raw?.hf_raw?.nli_core?.contradict)
+      }
+    }
   } : undefined;
 
   return {
     analysisSnapshot_v1: {
-      emotions, distortions, coreBeliefs: coreBelief, recommendedQuestions: questions,
+      emotions,
+      distortions,
+      coreBeliefs,
+      recommendedQuestions: questions,
       emoji: pickEmojiFromLabels(emotions),
       ...(hf ? { hf } : {}),
       llm: { text: llm.text || '', output: llm.output || parsed, confidences: llmConf }
@@ -575,7 +617,200 @@ async function analyzeWithLLMAndHF(userText) {
   };
 }
 
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   A/B 변형 프롬프트 선택 + 저장 제어 러너(runCBTAnalysis) + 공통 저장(persist)
+   - variant: 'A' | 'B'  (필요 시 더 늘려도 됨)
+   - save: false 면 messages/analysisSnapshot_v1/캘린더에 아무 것도 저장하지 않음
+   - persistAnalyzeResult: /gpt/analyze 경로에서 쓰던 저장 루틴을 공통화
+   ────────────────────────────────────────────────────────────────────────────*/
+
+/** V1/V2 실제 차이를 만드는 시스템 프롬프트(간결/보수 vs. 타이트/제약 강화) */
+function promptVariantV1({ coaching }) {
+  // 기존 빌더 유지
+  return buildSystemPromptStage1({ coaching });
+}
+function promptVariantV2({ coaching }) {
+  // V2는 키/제약을 더 타이트하게 (키 한글 고정, 길이 제한 등)
+  const base = buildSystemPromptStage1({ coaching });
+  return base + [
+    '',
+    '※ V2 추가 규칙',
+    '- 출력 키는 반드시 이 5개만: 감정, 인지왜곡, 핵심믿음, 추천질문, confidences',
+    '- 감정은 최대 4개, 핵심믿음/추천질문은 각 1개 문장(20~60자 권장).',
+    '- confidences 수치는 0~1, 소수 둘째 자리까지.',
+  ].join('\n');
+}
+
+/** variant → system 프롬프트 문자열 선택 */
+function selectPromptByVariant(variant, { coaching }) {
+  return (String(variant).toUpperCase() === 'B')
+    ? promptVariantV2({ coaching })
+    : promptVariantV1({ coaching }); // 기본 A
+}
+
+/** A/B 비교도, 일반 analyze도 이 함수 한 번으로 수행 가능 */
+async function runCBTAnalysis({
+  uid,
+  text,
+  dateKey,
+  variant = 'A',
+  save = true,               // compare는 false로
+  conversationId = null,     // analyze에서는 넘어옴
+  clientMessageId = null,
+}) {
+  if (!uid || !text) throw new Error('bad_params');
+  const dk = (dateKey && String(dateKey).slice(0, 10)) || new Date().toISOString().slice(0, 10);
+
+  const enableCoaching = false;     // 비교는 첫 턴 요약 기준
+  const enableCorrection = true;    // ±보정 ON
+  const safetyOn = false;           // 비교 때는 안전 게이트 OFF(응답 형태를 비교하려고)
+  const promptOverride = selectPromptByVariant(variant, { coaching: enableCoaching });
+
+  const { snapshot } = await analyzeMessage({
+    uid,
+    dateKey: dk,
+    conversationId,
+    userText: text,
+    mode: 'admin',                 // 파이프라인 동일 적용
+    enableCoaching,
+    enableCorrection,
+    safetyOn,
+    prevSnapshot: null,
+    promptOverride,
+  });
+
+  if (save) {
+    await persistAnalyzeResult({
+      uid,
+      dateKey: dk,
+      conversationId,
+      clientMessageId,
+      userText: text,
+      result: snapshot,
+    });
+  }
+
+  return { ...snapshot, usedVariant: String(variant || 'A') };
+}
+
+/** 어시스턴트 말풍선 포맷(요약 + 점수) */
+function formatAssistantSummary({ dateKey, out, confidences, hf, safety }) {
+  // 자해 신호가 있으면 날짜 프리픽스 없이 위기 안내만 보여줌
+  if (safety?.selfHarm) {
+    const crisis = (typeof safety.message === 'string' && safety.message.trim())
+      ? safety.message.trim()
+      : CRISIS_HELP_KO;
+    return crisis; // 날짜 프리픽스 없이 그대로 저장 → 프론트 inferLooksLikeSafety가 바로 잡아냄
+  }
+  const emo = Array.isArray(out['감정']) ? out['감정'].filter(Boolean) : [];
+  const dist = Array.isArray(out['인지왜곡']) ? out['인지왜곡'].filter(Boolean) : [];
+  const coreArr = Array.isArray(out['핵심믿음']) ? out['핵심믿음'].filter(Boolean)
+    : (out['핵심믿음'] ? [String(out['핵심믿음']).trim()] : []);
+  const qArr = Array.isArray(out['추천질문']) ? out['추천질문'].filter(Boolean)
+    : (out['추천질문'] ? [String(out['추천질문']).trim()] : []);
+  const core = coreArr[0] || '';
+  const q = qArr[0] || '';
+
+  const c = confidences || {};
+  const eavg = hf?.emotion?.avg;
+  const eent = hf?.emotion?.entropy;
+  const ent = hf?.nli?.core?.entail;
+  const ctr = hf?.nli?.core?.contradict;
+
+  return [
+    `[${dateKey}]`,
+    `감정: ${emo.join(', ') || '-'}`,
+    `인지 왜곡: ${dist.join(', ') || '-'}`,
+    `핵심 믿음: ${core || '-'}`,
+    `추천 질문: ${q || '-'}`,
+    '',
+    '— 점수(분리 표시) —',
+    `LLM 확신도 (감정/왜곡/핵심/질문): ${n2(c.emotions)} / ${n2(c.distortions)} / ${n2(c.coreBelief)} / ${n2(c.question)}`,
+    `HF emotions_avg / entropy: ${n4(eavg)} / ${n4(eent)}`,
+    `HF NLI entail / contradict: ${n4(ent)} / ${n4(ctr)}`,
+  ].join('\n');
+
+  function n2(x) { return (Number.isFinite(x) ? Number(x).toFixed(2) : '-'); }
+  function n4(x) { return (Number.isFinite(x) ? Number(x).toFixed(4) : '-'); }
+}
+
+//** 저장 공통 경로: 멱등 upsert → snapshot은 user 메시지에만 → 캘린더 집계 */
+async function persistAnalyzeResult({
+  uid,
+  dateKey,             // = sessionId (YYYY-MM-DD)
+  conversationId,      // 필수
+  clientMessageId,     // 멱등키(선택)
+  userText,
+  result,              // analyzeMessage/runCBTAnalysis에서 받은 snapshot
+}) {
+  if (!uid || !dateKey || !conversationId) throw new Error('bad_params');
+  const sessionId = String(dateKey).slice(0, 10);
+
+  // user 메시지 저장: snapshot/hf_raw 포함
+  const hf_raw = result?.hf ? {
+    emotion_entropy: result.hf?.emotion?.entropy ?? null,
+    emotions_avg: result.hf?.emotion?.avg ?? null,
+    hf_raw: result.hf,
+    nli_core: {
+      entail: result.hf?.nli?.core?.entail ?? null,
+      contradict: result.hf?.nli?.core?.contradict ?? null,
+    },
+  } : null;
+
+  await repo.addMessage({
+    uid,
+    sessionId,
+    conversationId,
+    message: {
+      role: 'user',
+      text: String(userText || ''),
+      clientMessageId: clientMessageId || undefined,
+      analysisSnapshot_v1: {
+        emotions: result.emotions || [],
+        distortions: result.distortions || [],
+        coreBeliefs: result.coreBeliefs || [],
+        recommendedQuestions: result.recommendedQuestions || [],
+        ...(result.emoji ? { emoji: result.emoji } : {}),
+        confidences: result.confidences || {},
+        ...(result.hf ? { hf: result.hf } : {}),
+        llm: result.llm || {},
+        ...(result.safety ? { safety: result.safety } : {}),
+      },
+      hf_raw,
+    },
+  });
+
+  // assistant 메시지(사람이 볼 텍스트만)
+  const asstText = formatAssistantSummary({
+    dateKey: sessionId,
+    out: result?.llm?.output || {},
+    confidences: (result?.llm?.confidences || result?.confidences || {}),
+    hf: result?.hf || null,
+    safety: result?.safety || null,
+  });
+
+  await repo.addMessage({
+    uid,
+    sessionId,
+    conversationId,
+    message: {
+      role: 'assistant',
+      text: asstText,
+      lastBot: true,
+      isSafety: !!(result?.safety?.selfHarm), // ← 안전문구 표시용 메타
+    },
+  });
+
+  // repo.addMessage 내부에서 recomputeCalendar 호출하므로 끝.
+  return { ok: true, conversationId };
+}
+
+
+
 module.exports = {
   analyzeMessage,
   analyzeWithLLMAndHF,
+  runCBTAnalysis,
+  persistAnalyzeResult,
 };

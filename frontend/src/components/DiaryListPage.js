@@ -4,7 +4,6 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import api from '../api';
-// 공통 이모지 컴포넌트/유틸 (추가)
 import Emoji, { emojiFromSessionSummary } from './emoji';
 
 function ymdKST(dLike) {
@@ -90,7 +89,7 @@ export default function DiaryListPage({ focusDate, onBack }) {
     }
   }
 
-  // 일자 섹션 토글 시: "펼칠 때마다" 항상 서버에서 다시 가져온다
+  // 일자 섹션 토글 시: 펼칠 때마다 항상 서버에서 다시 가져옴
   const toggleDate = async (dateKey) => {
     const nextOpen = !openKeys[dateKey];
     setOpenKeys((p) => ({ ...p, [dateKey]: nextOpen }));
@@ -101,7 +100,7 @@ export default function DiaryListPage({ focusDate, onBack }) {
     setDayDetails((p) => ({ ...p, [dateKey]: undefined }));
 
     try {
-      // ① 첫 사용자 인풋 목록
+      // 1 첫 사용자 인풋 목록
       const res = await api.get(`/days/${dateKey}/first-user-inputs`);
       const raw = res?.data?.data;
 
@@ -125,10 +124,10 @@ export default function DiaryListPage({ focusDate, onBack }) {
         })
         .filter((r) => (r.firstUserText || '').trim().length > 0);
 
-      // ② 같은 날짜의 모든 대화 → 제목 맵
+      // 2 같은 날짜의 모든 대화 → 제목 맵
       const titleMap = await fetchTitlesMap(dateKey);
 
-      // ③ 병합: 제목 붙이기
+      // 3 병합: 제목 붙이기
       const merged = normalized.map((r) => ({
         ...r,
         title: (titleMap[r.conversationId] || '').trim(),
@@ -194,7 +193,7 @@ export default function DiaryListPage({ focusDate, onBack }) {
               const open = !!openKeys[dateKey];
               const details = dayDetails[dateKey];
 
-              // 공통 규칙: topEmoji → lastEmoji → moodLabels 추론, 없으면 표시 안 함
+              // 공통 규칙: topEmoji => lastEmoji => moodLabels 추론, 없으면 표시 안 함
               const dayEmoji = emojiFromSessionSummary(mark);
 
               return (

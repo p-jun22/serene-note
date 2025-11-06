@@ -1,5 +1,5 @@
 // src/components/Message.js
-// 단일 메시지 렌더 + 인라인 편집 + (NEW) 피드백 UX(전송중/완료/자동숨김)
+// - 단일 메시지 렌더 + 인라인 편집 + 피드백 UX(전송중/완료/자동숨김)
 
 import React, { useEffect, useRef, useState } from "react";
 
@@ -12,10 +12,9 @@ export default function Message({
   onCancelEdit,
   onSaveEdit,
   isAdmin = false,
-  onRate,                     // (id, score) => Promise<boolean>
-  // NEW: 필요 시 상위가 강제로 숨길 수 있게 (null이면 자동판정)
+  onRate,                     // (id, score) => Promise<boolean> // 필요 시 상위가 강제로 숨길 수 있게 (null이면 자동판정)
   forceHideFeedback = null,   // true | false | null
-  // NEW: 모드 힌트(주면 정확하게 동작). 'admin' | 'user' | 'baseline'
+  // 모드 힌트(for 정확하게 동작) 'admin' | 'user' | 'baseline'
   mode = undefined,
 }) {
   const isUser = role === "user";
@@ -25,7 +24,7 @@ export default function Message({
   const [draft, setDraft] = useState(text);
   const taRef = useRef(null);
 
-  // NEW: 피드백 전송 상태
+  // 피드백 전송 상태
   const [sendingRate, setSendingRate] = useState(false);
   const [ratedScore, setRatedScore] = useState(null); // number|null
   const [hideBar, setHideBar] = useState(false);
@@ -49,7 +48,7 @@ export default function Message({
     onSaveEdit?.(id, t);
   };
 
-  // NEW: 피드백 클릭 → 전송중 표시 → 성공 시 감사표시 후 자동 숨김
+  // 피드백 클릭 => 전송중 표시 => 성공 시 감사표시 후 자동 숨김
   const handleRateClick = async (score) => {
     if (sendingRate || ratedScore != null) return;
     try {
@@ -70,10 +69,7 @@ export default function Message({
   };
   // ─────────────────────────────────────────────
   // 피드백 바 노출 규칙
-  // 1) admin → 항상 노출
-  // 2) baseline/basic → 항상 숨김
-  // 3) 안전(위기) 안내 메시지 → 일반 유저에서는 숨김
-  // 4) 상위가 forceHideFeedback 지정 시 그 값을 따름
+  // admin => 항상 노출, baseline/basic => 항상 숨김, 안전 고지 메시지 => 비교용 GPT 유저에서는 숨김
   // ─────────────────────────────────────────────
   const inferLooksLikeSafety = (() => {
     const t = String(text || "");
@@ -81,7 +77,7 @@ export default function Message({
     const hints = [
       /이 앱은 당신의 안전/,
       /가까운 보호자|친구|상담센터에 즉시 연락/,
-      /1393|129|1388|1577-0199|1644-0070|보건복지상담/,
+      /1393|109|1388||보건복지상담|자살예방상담/,
     ];
     // 안전 메시지는 우리가 의도적으로 날짜 프리픽스([YYYY-MM-DD])를 제거함
     const noDatePrefix = !/^\[\d{4}-\d{2}-\d{2}\]/.test(t);
@@ -107,30 +103,24 @@ export default function Message({
         <>
           <div className="bubble">{text}</div>
 
-           {isAssistant && !hideBar && !hideFeedback && (
+          {isAssistant && !hideBar && !hideFeedback && (
             <div className="feedback-bar" aria-live="polite">
               {ratedScore == null ? (
                 isAdmin ? (
-                  <>
-                    <button
-                      className="fb-btn neg"
-                      title="부적절/틀림(0)"
-                      disabled={sendingRate}
-                      aria-pressed="false"
-                      onClick={() => handleRateClick(0)}
-                    >
-                      {sendingRate ? "보내는 중..." : "👎 0"}
-                    </button>
-                    <button
-                      className="fb-btn pos"
-                      title="적절/맞음(1)"
-                      disabled={sendingRate}
-                      aria-pressed="false"
-                      onClick={() => handleRateClick(1)}
-                    >
-                      {sendingRate ? "보내는 중..." : "👍 1"}
-                    </button>
-                  </>
+                  <div className="fb-steps">
+                    {[1, 3, 5].map((n) => (
+                      <button
+                        key={n}
+                        className="fb-btn step"
+                        title={n === 1 ? "부적절/틀림 (1)" : n === 3 ? "중립 (3)" : "적절/맞음 (5)"}
+                        disabled={sendingRate}
+                        aria-pressed={false}
+                        onClick={() => handleRateClick(n)}
+                      >
+                        {sendingRate ? "…" : (n === 1 ? "👎 1" : n === 3 ? "😐 3" : "👍 5")}
+                      </button>
+                    ))}
+                  </div>
                 ) : (
                   <div className="fb-steps">
                     {[1, 2, 3, 4, 5].map((n) => (
@@ -148,7 +138,6 @@ export default function Message({
                   </div>
                 )
               ) : (
-                // 완료 메시지 (인라인 스타일만 사용, CSS 영향 최소화)
                 <div style={{ fontSize: ".9rem", color: "#6b6b6b", padding: "2px 4px" }}>
                   감사합니다! (평점 {ratedScore})
                 </div>
