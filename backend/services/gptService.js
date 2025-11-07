@@ -410,7 +410,6 @@ async function analyzeMessage({
       emotions: [],
       distortions: [],
       coreBeliefs: [],
-      // ★ 한 개의 멀티라인 문자열만 담아주면 , 로 이어지지 않음
       recommendedQuestions: [CRISIS_HELP_KO],
       llm: {
         text: '',

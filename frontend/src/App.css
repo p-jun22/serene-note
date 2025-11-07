@@ -1080,7 +1080,7 @@ body {
   background: #faf0ea;
   border: 1px solid #f2d2c6;
   color: #4a3c35;
-  border-radius: 999px;
+  border-radius: 24px;
   padding: 8px 12px;
   font-size: .92rem;
   font-weight: 700;
@@ -1656,3 +1656,10 @@ ul.diagnosis li.bad {
 
 .chip.na,.diag-badge.na{background:#f1f3f5;color:#495057}
 .chip.info,.diag-badge.info{background:#e7f5ff;color:#0b7285}
+
+/* chips & badges by color */
+.chip.green, .diag-badge.green { background:#e7f7ec; color:#0b7a39; }
+.chip.yellow, .diag-badge.yellow { background:#fff7e0; color:#9a6b00; }
+.chip.blue, .diag-badge.blue { background:#e9f2ff; color:#1e5fbf; }
+.chip.red, .diag-badge.red { background:#fde8e8; color:#b11b1b; }
+.chip.gray, .diag-badge.gray { background:#f1f3f5; color:#5b616e; }

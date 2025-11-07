@@ -1,16 +1,15 @@
 # backend/huggingface_server.py
-# ===============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # [역할/구성]
 # - Phase 1: /scores 에서 감정 확률·정규화 엔트로피·NLI(entail/contradict) 제공
 # - Phase 2: (gptService가 적용) 보정을 위한 HF 기준 신호 제공 (키 고정)
-# - Phase 3: 피드백 기반 Platt/Isotonic 학습/저장/평가
-#            /calibration/train, /calibration/profile, /eval/latest
+# - Phase 3: Platt/Isotonic 학습/저장/평가 (/calibration/train, /calibration/profile, /eval/latest)
 # - Phase 4: 경량 핫-리로드(/admin/reload)로 모델 아티팩트 교체
 #
 # [키/스키마 고정 — gptService.js 기대치]
 # /scores 응답:
 # {
-#   "emotions_avg": number,
+#   "emotions_avg": number,                  # 합성(Chosen-Mean, Peak, Focus)
 #   "emotion_entropy": number,               # 0~1 정규화
 #   "nli_core": { "entail": number, "contradict": number },
 #   "hf_raw": {
@@ -18,7 +17,7 @@
 #     "nli_core": { "entail": number, "neutral": number, "contradict": number }
 #   }
 # }
-# ===============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -27,7 +26,7 @@ from datetime import datetime
 import math, os, json, threading
 import re
 
-
+# Torch 옵션
 try:
     import torch
     HAS_TORCH = True
@@ -43,7 +42,15 @@ if HAS_TORCH and torch.cuda.is_available():
     DEVICE = int(os.getenv("HF_DEVICE", "0"))
     FP16 = os.getenv("HF_FP16", "1") == "1"
 
+# ===== 새 환경변수(없으면 기본값으로 동작) =====
+EMO_TOPK = int(os.getenv("HF_EMO_TOPK", "2"))            # 감정 top-k(폴백용)
+W_CHOSEN = float(os.getenv("HF_W_CHOSEN", "0.5"))        # 선택 감정 평균 가중치
+W_PEAK   = float(os.getenv("HF_W_PEAK",   "0.3"))        # 피크(최댓값) 가중치
+W_FOCUS  = float(os.getenv("HF_W_FOCUS",  "0.2"))        # 집중도(1-엔트로피) 가중치
 
+ENT_TOPK = int(os.getenv("HF_ENT_TOPK", "2"))            # entail 상위 문장 k
+ENT_SEG_AUTO = os.getenv("HF_ENT_SEG_AUTO", "1") == "1"  # 긴 문장 자동 세그먼트
+ENT_MINLEN = int(os.getenv("HF_ENT_MINLEN", "120"))      # 자동 세그 기준 길이
 
 # ===== 의존 패키지 로드 =====
 try:
@@ -66,10 +73,9 @@ except Exception:
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
-# ===============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # 전역 상태 (모델 이름과 파이프라인 객체 분리)
-
-# ===============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 ZSL_MODEL_NAME = os.getenv("ZSL_MODEL", "joeddav/xlm-roberta-large-xnli")
 NLI_MODEL_NAME = os.getenv("NLI_MODEL", "joeddav/xlm-roberta-large-xnli")
 
@@ -139,22 +145,47 @@ def normalize_emotion(label: str) -> str:
     if not label: return label
     return REVERSE_SYNONYM.get(str(label).strip(), str(label).strip())
 
-EMO_AVG_MODE = os.getenv("HF_EMO_AVG_MODE", "top2")  # mean|max|top2|top3...
-def _agg(vals):
-    if not vals: return 0.0
-    if EMO_AVG_MODE == "max":
-        return float(max(vals))
-    if EMO_AVG_MODE.startswith("top"):
-        try: k = int(EMO_AVG_MODE[3:])
-        except: k = 2
-        vals = sorted(vals, reverse=True)[:max(1,k)]
-    return float(sum(vals)/len(vals))
+# ─────────────────────────────────────────────────────────────────────────────
+# 스코어 유틸
+# ─────────────────────────────────────────────────────────────────────────────
+def normalized_entropy_from_scores(scores: List[float]) -> float:
+    if not scores: return 0.0
+    s = sum(scores)
+    if s <= 0: return 0.0
+    probs = [max(1e-12, p / s) for p in scores]
+    ent = -sum([p * math.log(p) for p in probs])
+    max_ent = math.log(len(probs)) if len(probs) > 1 else 1.0
+    return float(ent / max_ent) if max_ent > 0 else 0.0
 
+# 삼합 스코어(Chosen-Mean, Peak, Focus) 합성
+def _compose_emotion_score(emo_probs: Dict[str, float],
+                           all_scores: List[float],
+                           emotions_norm: List[str]) -> float:
+    """LLM 선택 감정 기준 + 피크 + 집중도(1-엔트로피) 합성 점수."""
+    chosen_vals = [float(emo_probs.get(l, 0.0)) for l in (emotions_norm or [])]
+    all_vals_sorted = sorted((float(v) for v in emo_probs.values()), reverse=True)
+    topk_vals = all_vals_sorted[:max(1, EMO_TOPK)] if all_vals_sorted else []
 
-# ===============================================================================
+    if chosen_vals:
+        chosen_mean = sum(chosen_vals) / len(chosen_vals)
+    elif topk_vals:
+        chosen_mean = sum(topk_vals) / len(topk_vals)   # 폴백
+    else:
+        chosen_mean = 0.0
+
+    peak = max(topk_vals) if topk_vals else (max(all_vals_sorted) if all_vals_sorted else 0.0)
+    focus = 1.0 - normalized_entropy_from_scores(all_scores)  # 0~1, 낮은 엔트로피일수록 ↑
+    score = W_CHOSEN*chosen_mean + W_PEAK*peak + W_FOCUS*focus
+    return float(max(0.0, min(1.0, score)))
+
+def _topk_mean(arr: List[float], k: int) -> float:
+    if not arr: return 0.0
+    k = max(1, min(k, len(arr)))
+    return float(sum(sorted(arr, reverse=True)[:k]) / k)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Firestore or LocalStore 추상화
-# ===============================================================================
-
+# ─────────────────────────────────────────────────────────────────────────────
 class Store:
     def __init__(self):
         # 환경변수로 강제 선택 가능: HF_STORE_MODE=local|firestore
@@ -207,10 +238,7 @@ class Store:
         self._write_local(data)
 
     def list_feedback(self, uid: str = None, date_from=None, date_to=None, limit=10000):
-        """피드백 표본 나열(학습용).
-        - local: users/*/feedback/* 전체 혹은 특정 uid만 스캔
-        - firestore: 특정 uid만 지원(전역 스캔은 배치 권장)
-        """
+        """피드백 표본 나열(학습용)."""
         if self.mode == "firestore":
             if not uid:
                 return []  # 전역 스캔은 운영 비용/권한 이슈로 생략
@@ -242,7 +270,6 @@ class Store:
             if not k.startswith("users/"): continue
             if "/feedback/" not in k: continue
             parts = k.split("/")
-            # k = users/{uid}/feedback/{docId}
             if len(parts) >= 4:
                 _uid = parts[1]
                 one = dict(v)
@@ -256,18 +283,9 @@ store = Store()
 def now_iso():
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# ==============================================================================
-# 수치 유틸: 정규화 엔트로피, Platt, Isotonic, 메트릭
-# ==============================================================================
-def normalized_entropy_from_scores(scores: List[float]) -> float:
-    if not scores: return 0.0
-    s = sum(scores)
-    if s <= 0: return 0.0
-    probs = [max(1e-12, p / s) for p in scores]
-    ent = -sum([p * math.log(p) for p in probs])
-    max_ent = math.log(len(probs)) if len(probs) > 1 else 1.0
-    return float(ent / max_ent) if max_ent > 0 else 0.0
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 캘리브레이션 유틸
+# ─────────────────────────────────────────────────────────────────────────────
 def train_platt(ps: List[float], ys: List[int], lr=1.0, iters=200, l2=1e-4) -> Tuple[float, float]:
     """간단 로지스틱 회귀(a,b): σ(a p + b)"""
     a, b = 1.0, 0.0
@@ -337,7 +355,7 @@ def compute_metrics(ps: List[float], ys: List[int], bins=10) -> Dict[str,float]:
         ece += (len(bucket)/n) * abs(acc-conf)
     # Brier
     brier = sum((p - y)**2 for p,y in zip(ps,ys)) / n
-    # EM(=accuracy), F1
+    # EM/F1
     tp=fp=fn=tn=0
     for p,y in zip(ps,ys):
         pred = 1 if p>=0.5 else 0
@@ -353,10 +371,9 @@ def compute_metrics(ps: List[float], ys: List[int], bins=10) -> Dict[str,float]:
         user_corr = 0.0
     return {"ece": float(ece), "brier": float(brier), "em": float(acc), "f1": float(f1), "user_corr": user_corr}
 
-# ===============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # 엔드포인트: 헬스/제로샷/NLI/점수
-# ===============================================================================
-
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "zsl_model": ZSL_MODEL_NAME, "nli_model": NLI_MODEL_NAME})
@@ -398,7 +415,7 @@ def nli_api():
     return jsonify({"results": results})
 
 def _split_sentences_ko(text: str):
-    # 문장 분할: 줄바꿈, 문장 종결부호(., ?, !, …) 또는 "다." 패턴
+    # 아주 간단한 분할: 줄바꿈, 문장 종결부호(., ?, !, …) 또는 "다." 패턴
     sents = re.split(r'(?:[\n\r]+|(?<=[\.!\?…])\s+|(?<=다\.)\s+)', text)
     return [s.strip() for s in sents if isinstance(s, str) and len(s.strip()) >= 3]
 
@@ -423,6 +440,10 @@ def scores_api():
     if isinstance(data.get("segment"), bool):
         segment = segment or bool(data.get("segment"))
 
+    # 긴 텍스트는 자동 세그먼트 on
+    if ENT_SEG_AUTO and len(text) >= ENT_MINLEN:
+        segment = True or segment
+
     if not segment:
         # --- 단일 텍스트
         emo_out = zero_shot(
@@ -440,9 +461,8 @@ def scores_api():
             canon = normalize_emotion(lab)
             emo_probs[canon] = max(sc, emo_probs.get(canon, 0.0))
 
-        chosen = [emo_probs.get(l, 0.0) for l in emotions_norm] if emotions_norm else []
-        emotions_avg = _agg(chosen)
         emotion_entropy = normalized_entropy_from_scores(scores)
+        emotions_avg = _compose_emotion_score(emo_probs, scores, emotions_norm)
 
         nli_result = {"entail": 0.0, "neutral": 0.0, "contradict": 0.0}
         if core_belief:
@@ -465,7 +485,7 @@ def scores_api():
             }
         })
 
-    # === 세그먼트 ON: 문장별 배치 ===
+    # --- 세그먼트 ON: 문장별 배치
     sents = _split_sentences_ko(text) or [text]
     label_list = [normalize_emotion(l) for l in DEFAULT_EMOTION_LABELS]
 
@@ -489,12 +509,11 @@ def scores_api():
     n_sent = float(len(sents))
     avg_probs = {l: (sum_probs[l] / n_sent) for l in label_list}
 
-    chosen = [avg_probs.get(l, 0.0) for l in emotions_norm] if emotions_norm else []
-    emotions_avg = _agg(chosen)
     emotion_entropy = float(sum(entropies)/len(entropies)) if entropies else \
         normalized_entropy_from_scores(list(avg_probs.values()))
+    emotions_avg = _compose_emotion_score(avg_probs, list(avg_probs.values()), emotions_norm)
 
-    # 문장별 NLI(간단 루프; 필요 시 배치로 최적화 가능)
+    # 문장별 NLI(상위-K 평균으로 희석 방지)
     nli_es, nli_ns, nli_cs = [], [], []
     if core_belief:
         for s in sents:
@@ -505,9 +524,9 @@ def scores_api():
             nli_ns.append(float(lm.get("neutral", 0.0)))
             nli_cs.append(float(lm.get("contradiction", 0.0)))
 
-    entail = float(sum(nli_es)/len(nli_es)) if nli_es else 0.0
-    neutral = float(sum(nli_ns)/len(nli_ns)) if nli_ns else 0.0
-    contradict = float(sum(nli_cs)/len(nli_cs)) if nli_cs else 0.0
+    entail     = _topk_mean(nli_es, ENT_TOPK) if nli_es else 0.0
+    neutral    = float(sum(nli_ns)/len(nli_ns)) if nli_ns else 0.0  # 중립은 평균 유지
+    contradict = float(sum(nli_cs)/len(nli_cs)) if nli_cs else 0.0  # 반증은 평균(과도한 max 억제)
 
     return jsonify({
         "emotions_avg": emotions_avg,
@@ -519,27 +538,9 @@ def scores_api():
         }
     })
 
-
-# ===============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # Phase 3: 캘리브레이션 학습/저장/프로필/리포트
-# ===============================================================================
-
-# 학습 데이터 스키마(권장):
-# /users/{uid}/feedback/{messageId}:
-# {
-#   label: { emotions:[], distortions:[], coreBelief:"" },
-#   rating: number|null,              # 1~5
-#   model:  {
-#     p_emotions, p_distortions, p_coreBelief, p_final_raw,
-#     hf_entropy, hf_entail, hf_contradict
-#   },
-#   dateKey, is_baseline, ...
-# }
-#
-# 보정 파라미터:
-# /calibration/global { platt:{a,b}?, isotonic:{bins[], map[]}?, metrics{...} }
-# /users/{uid}/calibration/current { rated_samples, min_samples, platt?, isotonic?, metrics{...} }
-
+# ─────────────────────────────────────────────────────────────────────────────
 def _extract_training_pairs(feedback_rows: List[dict]) -> Tuple[List[float], List[int], Dict[str,float]]:
     """p, y 추출. y는 rating>=4 → 1, else 0. p는 model.p_final_raw 우선."""
     ps, ys = [], []
@@ -662,7 +663,9 @@ def calibration_train():
 @app.get("/calibration/profile")
 def calibration_profile():
     uid = request.args.get("uid", None)
-    global_prof = store.get_doc("calibration/global") or {}
+    # 전역 보정 경로 폴백: calibration/global → users/_GLOBAL_/profile/calibration
+    global_prof = store.get_doc("calibration/global") or \
+                  store.get_doc("users/_GLOBAL_/profile/calibration") or {}
     personal = store.get_doc(f"users/{uid}/calibration/current") if uid else {}
     return jsonify({ "global": global_prof, "personal": personal })
 
@@ -677,9 +680,9 @@ def eval_latest():
     else:
         return jsonify({})
 
-# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # Phase 4: 모델 핫-리로드(LoRA/Adapter 아티팩트 전환)
-# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/admin/reload")
 def admin_reload():
     global ZSL_MODEL_NAME, NLI_MODEL_NAME  # 참조 전에 global 선언 필수
@@ -690,10 +693,9 @@ def admin_reload():
         load_models(new_zsl, new_nli)
     return jsonify({"ok": True, "zsl_model": ZSL_MODEL_NAME, "nli_model": NLI_MODEL_NAME})
 
-# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # 발표/요약 카드(참고)
-# ==============================================================================
-
+# ─────────────────────────────────────────────────────────────────────────────
 def _analyze_summary_logic(text: str):
     pol = zero_shot(text, candidate_labels=DEFAULT_POLARITY_LABELS, multi_label=False)
     pol_label = pol["labels"][0]; pol_score = pol["scores"][0]
@@ -722,10 +724,9 @@ def analyze_strength_api():
 def analyze_strength_alias():
     return analyze_strength_api()
 
-# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # 엔트리포인트
-# ==============================================================================
-
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5001"))
     app.run(host="0.0.0.0", port=port)

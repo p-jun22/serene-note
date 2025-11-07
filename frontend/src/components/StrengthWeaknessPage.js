@@ -1,23 +1,32 @@
 // src/components/StrengthWeaknessPage.js
-// - 세션별 강점·약점 분석 (상세)
-// - 세션 클릭 시 실제 "대화/메시지 개수" 및 스냅샷 평균을 집계
-// - 간단 진단을 수치 기반 규칙으로 동적 생성
-// - 점수 칩 클릭 시 계산식/이유/개선점/HF => GPT 흐름 모달 표시
-// - 상위 라벨(감정/인지왜곡/핵심믿음/추천질문) 빈도순 집계/표시
+// ─────────────────────────────────────────────────────────────────────────────
+// - HF 보정 프로필(Platt/Isotonic)을 불러와 LLM 확신도 p→q(원본→보정) 표시
+//   · good  → green   (좋음 계열)
+//   · warn  → blue    (중간/주의)
+//   · bad   → red     (낮음/경고)
+//   · info  → yellow  (정보성)
+//   · na    → gray    (신호 없음)
+// - NLI core_contradict는 "낮을수록 좋음"이므로 색상 판정 시 1 - value 로 반전하여 계산
+// - Hooks 호출 순서 준수 / ESLint 대응
+
+// - HF 서버 CORS 허용 필요. 기본: http://localhost:5001
+// - 보정 선택 규칙: 개인(표본≥min) 우선 → 전역 → 미적용
+// - q 계산은 메시지별 p에 보정 후 평균(q-avg). 없을 때는 p평균에 보정 적용.
+// ─────────────────────────────────────────────────────────────────────────────
 
 import React, { useEffect, useMemo, useState } from 'react';
 import api from '../api';
 import { onAuthStateChanged } from 'firebase/auth';
 import { auth } from '../firebase';
 
-// 날짜 유틸
+// ===== 환경 상수 =====
+const HF_BASE = process.env.REACT_APP_HF_BASE || 'http://localhost:5001';
+
+// ===== 날짜 유틸 =====
 function ymdKST(dLike) {
   const d = dLike instanceof Date ? dLike : new Date(dLike);
   return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Seoul',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
+    timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit',
   }).format(d);
 }
 function toFirstOfMonth(dateKeyOrDate) {
@@ -29,43 +38,52 @@ function monthLabel(firstOfMonthKey) {
   return `${y}년 ${m}월`;
 }
 
-// =========================================================================
-// 분류 규칙(색상)
-// =========================================================================
-function clamp01(x) {
-  const n = Number(x);
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(1, n));
-}
-function classifyLLMConfidence(v) {
-  const x = clamp01(v);
-  if (x >= 0.8) return 'good';
-  if (x >= 0.55) return 'warn';
-  return 'bad';
-}
-function classifyEmotionsAvg(v) {
-  const x = clamp01(v);
-  if (x >= 0.6) return 'good';
-  if (x >= 0.3) return 'warn';
-  return 'bad';
-}
-function classifyNLI(v) {
-  const x = clamp01(v);
-  if (x >= 0.7) return 'good';
-  if (x >= 0.35) return 'warn';
-  return 'bad';
+// ===== 분류 규칙(수치→등급) =====
+function clamp01(x) { const n = Number(x); if (!Number.isFinite(n)) return 0; return Math.max(0, Math.min(1, n)); }
+function classifyLLMConfidence(v) { const x = clamp01(v); if (x >= 0.8) return 'good'; if (x >= 0.55) return 'warn'; return 'bad'; }
+function classifyEmotionsAvg(v) { const x = clamp01(v); if (x >= 0.6) return 'good'; if (x >= 0.3) return 'warn'; return 'bad'; }
+function classifyNLI(v) { const x = clamp01(v); if (x >= 0.7) return 'good'; if (x >= 0.35) return 'warn'; return 'bad'; }
+
+// --- 엔트로피 정규화 유틸 ---
+// HF가 이미 [0,1] 정규화로 보낼 수도 있고(정책: “정규화 엔트로피”),
+// 간혹 ln(K) 스케일(>1)로 들어올 수도 있으므로 자동 보정한다.
+function entropyNorm(entropy, K = 10) {
+  const e = Number(entropy);
+  if (!Number.isFinite(e)) return null;
+  if (e <= 1.0000001) return Math.max(0, Math.min(1, e));     // 이미 정규화됨
+  const Hmax = Math.log(Math.max(2, K));
+  if (!(Hmax > 0)) return null;
+  return Math.max(0, Math.min(1, e / Hmax));                  // ln(K)로 정규화
 }
 function classifyEntropy(entropy, K = 10) {
-  const Hmax = Math.log(Math.max(2, K));
-  const norm = Hmax > 0 ? entropy / Hmax : 1;
-  if (norm <= 0.35) return { cls: 'good', norm };
-  if (norm <= 0.65) return { cls: 'warn', norm };
-  return { cls: 'bad', norm };
+  const norm = entropyNorm(entropy, K);
+  const n = Number.isFinite(norm) ? norm : 1; // 값 없으면 가장 불확실 쪽으로
+  if (n <= 0.35) return { cls: 'good', norm: n };
+  if (n <= 0.65) return { cls: 'warn', norm: n };
+  return { cls: 'bad', norm: n };
 }
 
-// =========================================================================
-// HF 톤 판정(표시 규칙)
-// =========================================================================
+// 등급→텍스트 라벨
+function labelForClass(cls) {
+  if (cls === 'good') return '좋음';
+  if (cls === 'warn') return '보통';
+  if (cls === 'bad') return '나쁨';
+  if (cls === 'info') return '정보';
+  if (cls === 'na') return 'N/A';
+  return '파랑';
+}
+
+// 등급→CSS 색상 클래스
+function colorForClass(cls) {
+  if (cls === 'good') return 'green';
+  if (cls === 'warn') return 'blue';
+  if (cls === 'bad') return 'red';
+  if (cls === 'info') return 'yellow';
+  if (cls === 'na') return 'gray';
+  return 'gray';
+}
+
+// ===== HF 톤/보조 판정 =====
 function nliNoSignal(hf) {
   const e = Math.abs(hf?.core_entail ?? 0);
   const c = Math.abs(hf?.core_contradict ?? 0);
@@ -73,118 +91,228 @@ function nliNoSignal(hf) {
 }
 function lowEmotionInfo(hf) {
   const a = hf?.emotions_avg ?? 0;
-  const h = hf?.emotion_entropy ?? 1;
-  return a < 0.25 && h <= 0.60;
+  const n = entropyNorm(hf?.emotion_entropy, hf?.K || 10) ?? 1;
+  return a < 0.25 && n <= 0.60; // 정규화 기준으로 판정
 }
 
-// =========================================================================
-// 설명(모달)
-// =========================================================================
+// ===== 수치/배열 유틸 =====
+function avg(nums) {
+  const arr = nums.map(Number).filter((n) => Number.isFinite(n));
+  if (!arr.length) return null;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+
+// ===== 스냅샷 파서 =====
+function pullFromRow(row) {
+  const snap = row?.analysisSnapshot_v1 || {};
+  const llmC = snap?.llm?.confidences || snap?.confidences || {};
+  const hfN = snap?.hf || {};
+  const hfR = row?.hf_raw || {};
+  return {
+    // LLM p(원본)
+    llm_emotions_p:  num(llmC.emotions),
+    llm_dist_p:      num(llmC.distortions),
+    llm_core_p:      num(llmC.coreBelief),
+    llm_q_p:         num(llmC.question),
+
+    // HF signals (snapshot.hf 우선, 없으면 hf_raw)
+    hf_emotions_avg: num(hfN?.emotion?.avg ?? hfR?.emotions_avg ?? hfR?.emotion?.avg),
+    hf_entropy:      num(hfN?.emotion?.entropy ?? hfR?.emotion_entropy ?? hfR?.emotion?.entropy),
+    hf_entail:       num(hfN?.nli?.core?.entail ?? hfR?.nli_core?.entail ?? hfR?.nli?.core?.entail),
+    hf_contradict:   num(hfN?.nli?.core?.contradict ?? hfR?.nli_core?.contradict ?? hfR?.nli?.core?.contradict),
+    _raw: row,
+  };
+}
+
+// ===== 라벨 집계 =====
+function pickArr(v) { return Array.isArray(v) ? v.filter(Boolean) : []; }
+function pushCount(map, key) { if (!key) return; const k = String(key).trim(); if (!k) return; map[k] = (map[k] || 0) + 1; }
+function extractLabelsFromSnapshot(snap = {}) {
+  const out = { emotions: [], distortions: [], coreBeliefs: [], questions: [] };
+  const llmOut = snap?.llm?.output || {};
+  out.emotions =
+    pickArr(snap.emotions) || pickArr(llmOut['감정']) || pickArr(llmOut.emotions);
+  out.distortions =
+    pickArr(snap.distortions) || pickArr(llmOut['인지왜곡']) || pickArr(llmOut.distortions) || [];
+  if (Array.isArray(snap.coreBeliefs) && snap.coreBeliefs.length > 0) out.coreBeliefs = snap.coreBeliefs;
+  else {
+    const core = llmOut['핵심믿음'] ?? llmOut.coreBelief ?? llmOut.core_belief ?? snap.coreBelief ?? null;
+    if (core) out.coreBeliefs = [core];
+  }
+  if (Array.isArray(snap.recommendedQuestions) && snap.recommendedQuestions.length > 0) out.questions = snap.recommendedQuestions;
+  else {
+    const q = llmOut['추천질문'] ?? llmOut.question ?? null;
+    if (q) out.questions = [q];
+  }
+  return out;
+}
+function topK(map, k = 6) { return Object.entries(map).sort((a, b) => b[1] - a[1]).slice(0, k); }
+
+// ===== 보정기 생성(Platt/Isotonic) =====
+function makeCalibrator(profile) {
+  const personal = profile?.personal || {};
+  const global = profile?.global || {};
+
+  const hasPersonal = (personal?.platt || personal?.isotonic) &&
+    (Number(personal?.rated_samples || 0) >= Number(personal?.min_samples || 0));
+
+  const use = hasPersonal ? personal : (global || {});
+  let mode = 'none';
+  let platt = null;
+  let iso = null;
+
+  if (use?.platt) {
+    platt = { a: Number(use.platt.a), b: Number(use.platt.b) };
+    mode = `${hasPersonal ? 'personal' : 'global'}-platt`;
+  } else if (use?.isotonic && Array.isArray(use.isotonic.bins) && Array.isArray(use.isotonic.map)) {
+    iso = { bins: use.isotonic.bins.map(Number), map: use.isotonic.map.map(Number) };
+    mode = `${hasPersonal ? 'personal' : 'global'}-isotonic`;
+  }
+
+  function applyPlatt(p) {
+    const x = Math.max(0, Math.min(1, Number(p)));
+    const z = platt.a * x + platt.b;
+    return 1 / (1 + Math.exp(-z));
+  }
+  function applyIso(p) {
+    const x = Math.max(0, Math.min(1, Number(p)));
+    const edges = iso.bins, acc = iso.map;
+    let lo = 0, hi = edges.length - 1;
+    while (lo + 1 < hi) {
+      const mid = (lo + hi) >> 1;
+      if (x < edges[mid]) hi = mid;
+      else lo = mid;
+    }
+    return (acc[lo] ?? x);
+  }
+
+  const apply = (p) => {
+    if (!Number.isFinite(Number(p))) return null;
+    if (platt) return applyPlatt(p);
+    if (iso) return applyIso(p);
+    return Number(p);
+  };
+
+  return { apply, mode, details: { personal, global } };
+}
+
+// ===== 설명(모달) =====
 function buildExplain(metricKey, value, extra = {}) {
-  const v = (value ?? 0).toFixed(2);
   const K = extra.K || 10;
   const bullets = [];
-  let title = '';
-  let formula = '';
-  let reason = '';
-  let improvement = '';
+  let title = ''; let formula = ''; let reason = ''; let improvement = ''; let p = null; let q = null; let mode = null;
+
+  if (value && typeof value === 'object' && ('p' in value || 'q' in value)) {
+    p = Number.isFinite(+value.p) ? +value.p : null;
+    q = Number.isFinite(+value.q) ? +value.q : null;
+    mode = value.mode || null;
+  }
+  const pqLine = (p != null || q != null) ? `p${p!=null?`=${p.toFixed(2)}`:''}${q!=null?` → q=${q.toFixed(2)}`:''}${mode?`  [${mode}]`:''}` : '';
+
   const flow = [
-    '① 사용자 입력 → LLM 1차 해석(감정/왜곡/핵심/질문 + 확신도).',
-    '② 같은 입력을 HF 모델들에 투입(감정 zero-shot / NLI).',
-    '③ HF 산출물을 가중치로 사용해 GPT 판단을 보정(감정 평균·엔트로피, NLI entail/contradict).',
-    '④ 보정 결과를 세션 리포트(평균, 상위 라벨, 예시)로 집계.',
+    '① 사용자 입력 → LLM 1차 해석(감정/왜곡/핵심/질문 + 확신도 p).',
+    '② HF 지표 산출(감정 avg/entropy, NLI entail/contradict).',
+    '③ 보정 프로필(개인 우선→전역)로 p→q 보정(Platt/Isotonic).',
+    '④ q 기반 요약/표시, 게이팅/코칭은 서비스 규칙에 따름.',
   ].join('\n');
 
   switch (metricKey) {
     case 'llm_emotions':
-      title = `LLM 감정 확신도 (${v})`;
-      formula = 'C_llm_emotions = (1/N)·Σ_i conf_i  (각 메시지의 감정 확신도 평균)';
-      reason = '모델의 감정 라벨 신뢰도를 정량화.';
-      improvement = '낮다면 라벨 정의/프롬프트 보강.';
-      bullets.push('(수치 종류: 확률/로짓 기반 확신도)');
+      title = `LLM 감정 확신도 ${pqLine}`;
+      formula = 'q = σ(a·p + b)  // Platt (개인≥min이면 개인, 아니면 전역)\n또는 q = isotonic(p)  // bins/map 단조 보정';
+      reason = '보정으로 과신/과소신 조절, 신뢰도 분포를 현실에 맞춤.';
+      improvement = '개인 표본을 늘리면 개인 보정으로 자동 승급.';
+      bullets.push('색상 없이 숫자만 표시합니다.');
       break;
     case 'llm_dist':
-      title = `LLM 왜곡 확신도 (${v})`;
-      formula = 'C_llm_distortion = (1/N)·Σ_i conf_i';
-      reason = '왜곡 판단의 일관성/자신감 지표.';
-      improvement = '라벨 가이드·few-shot 보강.';
-      bullets.push('(수치 종류: 확률/로짓 기반 확신도)');
+      title = `LLM 왜곡 확신도 ${pqLine}`;
+      formula = '동일(Platt/Isotonic) 방식으로 p→q';
+      reason = '왜곡 라벨 일관성 보정.';
+      improvement = 'few-shot/라벨 정의 보강 병행.';
+      bullets.push('색상 없이 숫자만 표시합니다.');
       break;
     case 'llm_core':
-      title = `LLM 핵심믿음 확신도 (${v})`;
-      formula = 'C_llm_core = (1/N)·Σ_i conf_i';
-      reason = '핵심믿음 추출의 안정성 지표.';
-      improvement = '후보 리스트화/선택형 보정.';
-      bullets.push('(수치 종류: 확률/로짓 기반 확신도)');
+      title = `LLM 핵심믿음 확신도 ${pqLine}`;
+      formula = '동일(Platt/Isotonic) 방식으로 p→q';
+      reason = '핵심믿음 추출 안정성 보정.';
+      improvement = '후보 리스트/선택형 UX로 보조.';
+      bullets.push('색상 없이 숫자만 표시합니다.');
       break;
     case 'llm_q':
-      title = `LLM 질문 확신도 (${v})`;
-      formula = 'C_llm_q = (1/N)·Σ_i conf_i';
-      reason = '코칭 질문 생성에 대한 확신.';
+      title = `LLM 질문 확신도 ${pqLine}`;
+      formula = '동일(Platt/Isotonic) 방식으로 p→q';
+      reason = '코칭 질문 생성 신뢰도 보정.';
       improvement = '질문 템플릿/의도 슬롯화.';
-      bullets.push('(수치 종류: 확률/로짓 기반 확신도)');
+      bullets.push('색상 없이 숫자만 표시합니다.');
       break;
-    case 'hf_emotions_avg':
-      title = `HF emotions_avg (${v}) — (감정 평균 점수)`;
-      formula = 'emotions_avg = (1/N)·Σ_i p_i  (감정 확률의 평균)';
-      reason = '감정 분류 출력의 평균 확률; 높을수록 특정 감정으로 수렴.';
-      improvement = '클래스 수 조정·재학습으로 분포 명확화.';
-      bullets.push('(수치 종류: 평균 확률)');
-      break;
+    case 'hf_emotions_avg': {
+      const v = Number.isFinite(+value) ? (+value).toFixed(2) : '-';
+      title = `HF emotions_avg (${v}) — 감정 평균 점수`;
+      formula = 'LLM 선택 감정 기반 확률 평균(필요 시 합성 로직 적용)';
+      reason = '특정 감정으로 수렴할수록 ↑';
+      improvement = '라벨 축소/데이터 튜닝.';
+      break; }
     case 'hf_entropy': {
-      const { norm } = classifyEntropy(value, K);
-      title = `HF emotion_entropy (${v}) — 정규화 ${(norm || 0).toFixed(2)}`;
-      formula = `H = -Σ_c p(c)·log p(c),  H_max = ln K (K=${K}),  H_norm = H/H_max`;
-      reason = '감정 분포의 퍼짐 정도. 낮을수록 한 감정에 집중 → 신뢰 ↑';
-      improvement = '라벨 축소·데이터 증강 등으로 불확실성 완화.';
-      bullets.push('(수치 종류: 정보 엔트로피)');
-      break;
-    }
-    case 'hf_entail':
-      title = `HF core_entail (${v}) — 핵심믿음 정당화(NLI)`;
-      formula = 'entail = p(hypothesis | premise)  // NLI 소프트맥스';
+      const raw = Number(value);
+      const n = entropyNorm(raw, K);
+      title = `HF emotion_entropy (${Number.isFinite(raw)?raw.toFixed(2):'-'}) — 정규화 ${Number.isFinite(n)?n.toFixed(2):'-'}`;
+      formula = `정규화 규칙: e<=1이면 e(이미 정규화), e>1이면 e/ln(K) (K=${K})`;
+      reason = '낮을수록 집중(신뢰 ↑)';
+      improvement = '데이터 증강/라벨 가이드.';
+      break; }
+    case 'hf_entail': {
+      const v = Number.isFinite(+value) ? (+value).toFixed(2) : '-';
+      title = `HF core_entail (${v}) — NLI 정당화`;
+      formula = 'entail = p(entailment | premise, hypothesis)';
       reason = '핵심믿음이 본문으로 정당화되는 정도.';
-      improvement = '핵심믿음 문장화 후 NLI 직접 검증.';
-      bullets.push('(수치 종류: 소프트맥스 확률)');
-      break;
-    case 'hf_contradict':
-      title = `HF core_contradict (${v}) — 핵심믿음 반증(NLI)`;
-      formula = 'contradict = p(contradiction | premise)  // NLI 소프트맥스';
-      reason = '핵심믿음을 반박하는 증거 가능성.';
-      improvement = '과도한 일반화·극단화 제거 후 재검증.';
-      bullets.push('(수치 종류: 소프트맥스 확률)');
-      break;
+      improvement = '핵심믿음 문장화/근거 정렬.';
+      break; }
+    case 'hf_contradict': {
+      const v = Number.isFinite(+value) ? (+value).toFixed(2) : '-';
+      title = `HF core_contradict (${v}) — NLI 반증(낮을수록 좋음)`;
+      formula = 'contradict = p(contradiction | premise, hypothesis)';
+      reason = '반증 신호.';
+      improvement = '극단화/일반화 완화.';
+      break; }
     default:
-      title = `점수 (${v})`;
+      title = '지표';
       formula = '-'; reason = '-'; improvement = '-';
   }
   return { title, formula, reason, improvement, bullets, flow };
 }
 
-// =========================================================================
-// 칩/모달
-// =========================================================================
-function ScoreChip({ label, value, kind, onClick, hint, tone }) {
-  const val = Number.isFinite(+value) ? (+value).toFixed(2) : '-';
+// ===== 칩(색상 계산 고정: 색 이름 클래스만 사용) =====
+function ScoreChip({ label, value, cal, kind, onClick, hint, tone, invert = false, noColor = false }) {
+  const show = (v) => Number.isFinite(+v) ? (+v).toFixed(2) : '-';
+  const text = cal != null ? `${show(value)}→${show(cal)}` : show(value);
+  const basis = (cal != null ? cal : value);
+
   let cls = 'chip';
-  // tone이 오면 강제, 없으면 기존 규칙
-  if (tone) {
-    cls += ` ${tone}`;
-  } else if (kind === 'llm') {
-    cls += ` ${classifyLLMConfidence(value)}`;
-  } else if (kind === 'hf-entropy') {
-    cls += ` ${classifyEntropy(value).cls}`;
-  } else if (kind === 'hf-avg') {
-    cls += ` ${classifyEmotionsAvg(value)}`;
-  } else if (kind === 'hf-nli') {
-    cls += ` ${classifyNLI(value)}`;
+  const addColor = (level) => { cls += ` ${colorForClass(level)}`; };
+
+  if (!noColor) {
+    if (tone) {
+      addColor(tone); // tone은 'info' 또는 'na'로 들어옴 → yellow/gray
+    } else if (kind === 'llm') {
+      // 요청: LLM 칩은 색상 제거 → 패스
+    } else if (kind === 'hf-entropy') {
+      addColor(classifyEntropy(basis).cls);
+    } else if (kind === 'hf-avg') {
+      addColor(classifyEmotionsAvg(basis));
+    } else if (kind === 'hf-nli') {
+      const score = invert ? (1 - clamp01(basis)) : basis; // contradict는 invert=true
+      addColor(classifyNLI(score));
+    }
   }
+
   return (
     <button className={cls} onClick={onClick} title={hint || ''}>
-      <b>{label}</b><span className="dot">•</span><span>{val}</span>
+      <b>{label}</b><span className="dot">•</span><span>{text}</span>
     </button>
   );
 }
+
 function MetricModal({ open, onClose, payload }) {
   if (!open || !payload) return null;
   const { title, formula, reason, improvement, bullets = [], flow } = payload;
@@ -215,203 +343,84 @@ function MetricModal({ open, onClose, payload }) {
   );
 }
 
-// =========================================================================
-// 평균 계산(스냅샷 파서)
-// =========================================================================
-function avg(nums) {
-  const arr = nums.map(Number).filter((n) => Number.isFinite(n));
-  if (!arr.length) return null;
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
-}
-function pullFromRow(row) {
-  const snap = row?.analysisSnapshot_v1 || {};
-  // 우선순위: snapshot.llm.confidences > snapshot.confidences
-  const llmC = snap?.llm?.confidences || snap?.confidences || {};
-  const hfN = snap?.hf || {};
-  const hfR = row?.hf_raw || {};
-  const num = (v) => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-  };
-  return {
-    // LLM confidences
-    llm_emotions: num(llmC.emotions),
-    llm_dist: num(llmC.distortions),
-    llm_core: num(llmC.coreBelief),
-    llm_q: num(llmC.question),
-
-    // HF signals (snapshot.hf 우선, 없으면 hf_raw 폴백)
-    hf_emotions_avg: num(hfN?.emotion?.avg ?? hfR?.emotions_avg ?? hfR?.emotion?.avg),
-    hf_entropy: num(hfN?.emotion?.entropy ?? hfR?.emotion_entropy ?? hfR?.emotion?.entropy),
-    hf_entail: num(hfN?.nli?.core?.entail ?? hfR?.nli_core?.entail ?? hfR?.nli?.core?.entail),
-    hf_contradict: num(hfN?.nli?.core?.contradict ?? hfR?.nli_core?.contradict ?? hfR?.nli?.core?.contradict),
-  };
-}
-
-// =========================================================================
-// 라벨 추출/집계
-// =========================================================================
-function pickArr(v) {
-  return Array.isArray(v) ? v.filter(Boolean) : [];
-}
-function pushCount(map, key) {
-  if (!key) return;
-  const k = String(key).trim();
-  if (!k) return;
-  map[k] = (map[k] || 0) + 1;
-}
-
-// DB 구조 변경 대응: 최상위 배열(snap.*) 우선 / 그다음 llm.output / 다양한 키 변형 수용
-function extractLabelsFromSnapshot(snap = {}) {
-  const out = { emotions: [], distortions: [], coreBeliefs: [], questions: [] };
-  const llmOut = snap?.llm?.output || {};
-
-  // 감정
-  out.emotions =
-    pickArr(snap.emotions) ||
-    pickArr(llmOut['감정']) ||
-    pickArr(llmOut.emotions);
-
-  // 인지 왜곡 (배열/필드 모두 확인)
-  out.distortions =
-    pickArr(snap.distortions) ||
-    pickArr(llmOut['인지왜곡']) ||
-    pickArr(llmOut.distortions) ||
-    [];
-
-  // 핵심 믿음 (배열/단일값 모두 확인)
-  if (Array.isArray(snap.coreBeliefs) && snap.coreBeliefs.length > 0) {
-    out.coreBeliefs = snap.coreBeliefs;
-  } else {
-    const core =
-      llmOut['핵심믿음'] ??
-      llmOut.coreBelief ??
-      llmOut.core_belief ??
-      snap.coreBelief ??
-      null;
-    if (core) out.coreBeliefs = [core];
-  }
-
-  // 추천 질문 (배열/단일 혼합 대응)
-  if (Array.isArray(snap.recommendedQuestions) && snap.recommendedQuestions.length > 0) {
-    out.questions = snap.recommendedQuestions;
-  } else {
-    const q =
-      llmOut['추천질문'] ??
-      llmOut.question ??
-      null;
-    if (q) out.questions = [q];
-  }
-
-  return out;
-}
-
-function topK(map, k = 6) {
-  return Object.entries(map).sort((a, b) => b[1] - a[1]).slice(0, k);
-}
-
-// =========================================================================
-// 진단 빌더
-// =========================================================================
+// ===== 진단 빌더 =====
 function buildDiagnosis(summary) {
   const items = [];
   if (!summary) return items;
-  const { llm, hf, msgCount = 0 } = summary;
+  const { hf, msgCount = 0 } = summary;
   const ent = classifyEntropy(hf.emotion_entropy, hf.K || 10);
   const isNliNA = nliNoSignal(hf);
   const isLowEmoInfo = lowEmotionInfo(hf);
 
-  // 1) LLM 감정 확신도
-  const emoCls = classifyLLMConfidence(llm.emotions);
-  items.push({
-    cls: emoCls,
-    text:
-      emoCls === 'good'
-        ? `LLM 감정 확신도 높음(≥0.80) → 안정적 해석 가능. (현재 ${(llm.emotions || 0).toFixed(2)})`
-        : emoCls === 'warn'
-          ? `LLM 감정 확신도 보통(0.55~0.80). 추가 근거가 있으면 더 좋아요. (현재 ${(llm.emotions || 0).toFixed(2)})`
-          : `LLM 감정 확신도 낮음(<0.55). 라벨/프롬프트 보강 권장. (현재 ${(llm.emotions || 0).toFixed(2)})`,
-  });
+  // (요청) LLM 관련 진단 제거
 
-  // 2) HF emotions_avg (신호 약함은 '정보'로 처리)
+  // HF emotions_avg
   if (isLowEmoInfo) {
-    items.push({
-      cls: 'info',
-      text: `감정 신호 약함(텍스트 신호 낮음). emotions_avg ${(hf.emotions_avg || 0).toFixed(2)}, entropy ${(hf.emotion_entropy || 0).toFixed(2)}.`,
-    });
+    items.push({ cls: 'info', text: `감정 신호 약함(정보). emotions_avg ${(hf.emotions_avg||0).toFixed(2)}, entropy ${(entropyNorm(hf.emotion_entropy, hf.K||10)??0).toFixed(2)}.` });
   } else {
-    const avgCls = classifyEmotionsAvg(hf.emotions_avg);
-    items.push({
-      cls: avgCls,
-      text:
-        avgCls === 'good'
-          ? `HF 감정 평균 점수 높음(≥0.60) → 특정 감정으로 수렴. (현재 ${(hf.emotions_avg || 0).toFixed(2)})`
-          : avgCls === 'warn'
-            ? `HF 감정 평균 점수 중간(0.30~0.60). 다소 분산 가능. (현재 ${(hf.emotions_avg || 0).toFixed(2)})`
-            : `HF 감정 평균 점수 낮음(<0.30) → 불확실성 존재. (현재 ${(hf.emotions_avg || 0).toFixed(2)})`,
-    });
+    const lvl = classifyEmotionsAvg(hf.emotions_avg);
+    items.push({ cls: lvl, text: `HF 감정 평균 점수 ${labelForClass(lvl)} (현재 ${(hf.emotions_avg||0).toFixed(2)}).` });
   }
 
-  // 3) 엔트로피
-  items.push({
-    cls: ent.cls,
-    text:
-      ent.cls === 'good'
-        ? `감정 분포 집중(정규화 ${(ent.norm || 0).toFixed(2)} ≤ 0.35) → 일관된 감정 추정.`
-        : ent.cls === 'warn'
-          ? `감정 분포 보통(정규화 ${(ent.norm || 0).toFixed(2)}).`
-          : `감정 분포 넓음(정규화 ${(ent.norm || 0).toFixed(2)} > 0.65) → 여러 감정이 섞임.`,
-  });
+  // 엔트로피
+  items.push({ cls: ent.cls, text: `감정 분포 집중도 ${labelForClass(ent.cls)} (정규화 ${(ent.norm||0).toFixed(2)}).` });
 
-  // 4) NLI 일관성 (미검출은 N/A로)
-  if (isNliNA) {
-    items.push({ cls: 'na', text: '핵심믿음 미검출 (NLI 신호 N/A).' });
-  } else {
-    const contraHigh = (hf.core_contradict ?? 0) >= 0.20;
-    const entailCls = classifyNLI(hf.core_entail);
-    const contraCls = classifyNLI(1 - hf.core_contradict);
-    items.push({
-      cls: contraHigh ? 'warn' : (entailCls === 'good' && contraCls === 'good' ? 'good' : 'warn'),
-      text: contraHigh
-        ? `반증 신호 높음(contradict ${(hf.core_contradict || 0).toFixed(2)} ≥ 0.20) → 핵심믿음 재점검 권장.`
-        : `핵심믿음 정당화 점검(entail ${(hf.core_entail || 0).toFixed(2)}, contradict ${(hf.core_contradict || 0).toFixed(2)}).`,
-    });
+  // NLI
+  if (isNliNA) items.push({ cls: 'na', text: '핵심믿음 NLI 신호 회색(N/A).' });
+  else {
+    const entailLvl = classifyNLI(hf.core_entail);
+    const contraScore = 1 - clamp01(hf.core_contradict ?? 0); // 낮을수록 좋음 → 반전
+    const contraLvl = classifyNLI(contraScore);
+    items.push({ cls: entailLvl, text: `핵심믿음 정당화(Entail) ${labelForClass(entailLvl)} (현재 ${(hf.core_entail||0).toFixed(2)}).` });
+    items.push({ cls: contraLvl, text: `핵심믿음 반증(Contradict) 낮을수록 좋음 → ${labelForClass(contraLvl)} (현재 ${(hf.core_contradict||0).toFixed(2)}).` });
   }
 
-  // 5) LLM => HF 불일치 경고
-  if (classifyLLMConfidence(llm.emotions) === 'good' && classifyEmotionsAvg(hf.emotions_avg) === 'bad') {
-    items.push({
-      cls: 'warn',
-      text: 'LLM 확신도는 높은데 HF 평균이 낮음 → 근거 문장 강조/라벨 재점검 권장.',
-    });
-  }
-
-  // 6) 샘플 수 경고
-  if (msgCount < 3) {
-    items.push({
-      cls: 'warn',
-      text: `메시지 수가 적음(${msgCount}개) → 통계적 신뢰가 낮을 수 있어요.`,
-    });
-  }
+  // 표본 수
+  if (msgCount < 3) items.push({ cls: 'info', text: `메시지 수가 적습니다(${msgCount}개). 평균치 변동성이 클 수 있어요.` });
 
   return items;
 }
 
-// =========================================================================
-// 메인
-// =========================================================================
+// ===== 메인 컴포넌트 =====
 export default function StrengthWeaknessPage() {
   const [authed, setAuthed] = useState(false);
+  const [uid, setUid] = useState(null);
   const [pivot, setPivot] = useState(toFirstOfMonth(new Date()));
-  const [sessions, setSessions] = useState([]); // [{dateKey, count, topEmoji}]
-  const [active, setActive] = useState(null);    // dateKey
-  const [summary, setSummary] = useState(null);  // { dateKey, convCount, msgCount, llm:{...}, hf:{...}, labels:{...}, hfCount }
+  const [sessions, setSessions] = useState([]);
+  const [active, setActive] = useState(null);
+  const [summary, setSummary] = useState(null);
   const [modal, setModal] = useState(null);
 
+  // 보정 프로필
+  const [calib, setCalib] = useState({ mode: 'none', apply: (p)=>p, details: {} });
+
+  // Auth
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (u) => setAuthed(!!u));
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setAuthed(!!u);
+      setUid(u?.uid || null);
+    });
     return () => unsub();
   }, []);
+
+  // 보정 프로필 로드
+  useEffect(() => {
+    let aborted = false;
+    async function loadProfile() {
+      if (!authed || !uid) { setCalib({ mode:'none', apply:(p)=>p, details:{} }); return; }
+      try {
+        const res = await fetch(`${HF_BASE}/calibration/profile?uid=${encodeURIComponent(uid)}`);
+        const data = await res.json();
+        if (aborted) return;
+        const c = makeCalibrator(data || {});
+        setCalib(c);
+      } catch {
+        setCalib({ mode:'none', apply:(p)=>p, details:{} });
+      }
+    }
+    loadProfile();
+    return () => { aborted = true; };
+  }, [authed, uid]);
 
   // 월 세션 로드
   useEffect(() => {
@@ -425,13 +434,12 @@ export default function StrengthWeaknessPage() {
       const rows = Object.entries(data).map(([dateKey, v]) => ({ dateKey, ...v }));
       rows.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
       setSessions(rows);
-      if (!rows.find(r => r.dateKey === active)) {
-        setActive(rows[0]?.dateKey || null);
-      }
+      if (!rows.find(r => r.dateKey === active)) setActive(rows[0]?.dateKey || null);
     })().catch(() => setSessions([]));
-  }, [pivot, authed]); // eslint-disable-line
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pivot, authed]);
 
-  // 세션 요약 로드(대화/메시지 개수 + 평균 + 라벨 집계)
+  // 세션 요약 로드
   useEffect(() => {
     if (!authed || !active) { setSummary(null); return; }
     (async () => {
@@ -452,17 +460,34 @@ export default function StrengthWeaknessPage() {
         p?.hf_emotions_avg != null || p?.hf_entropy != null || p?.hf_entail != null || p?.hf_contradict != null
       ).length;
 
+      // LLM p-avg
+      const p_emotions = avg(pulled.map(p => p.llm_emotions_p));
+      const p_dist     = avg(pulled.map(p => p.llm_dist_p));
+      const p_core     = avg(pulled.map(p => p.llm_core_p));
+      const p_q        = avg(pulled.map(p => p.llm_q_p));
+
+      // LLM q-avg (메시지별 p→q 후 평균; p가 없으면 null)
+      const q_emotions = avg(pulled.map(p => p.llm_emotions_p!=null ? calib.apply(p.llm_emotions_p) : null).filter(v=>v!=null))
+        ?? (p_emotions!=null ? calib.apply(p_emotions) : null);
+      const q_dist     = avg(pulled.map(p => p.llm_dist_p!=null ? calib.apply(p.llm_dist_p) : null).filter(v=>v!=null))
+        ?? (p_dist!=null ? calib.apply(p_dist) : null);
+      const q_core     = avg(pulled.map(p => p.llm_core_p!=null ? calib.apply(p.llm_core_p) : null).filter(v=>v!=null))
+        ?? (p_core!=null ? calib.apply(p_core) : null);
+      const q_q        = avg(pulled.map(p => p.llm_q_p!=null ? calib.apply(p.llm_q_p) : null).filter(v=>v!=null))
+        ?? (p_q!=null ? calib.apply(p_q) : null);
+
       const llm = {
-        emotions: avg(pulled.map(p => p.llm_emotions)) ?? 0.90,
-        distortions: avg(pulled.map(p => p.llm_dist)) ?? 0.80,
-        core: avg(pulled.map(p => p.llm_core)) ?? 0.85,
-        q: avg(pulled.map(p => p.llm_q)) ?? 0.75,
+        emotions_p: p_emotions ?? 0.90, emotions_q: q_emotions ?? p_emotions ?? 0.90,
+        distortions_p: p_dist ?? 0.80,  distortions_q: q_dist ?? p_dist ?? 0.80,
+        core_p: p_core ?? 0.85,         core_q: q_core ?? p_core ?? 0.85,
+        q_p: p_q ?? 0.75,               q_q: q_q ?? p_q ?? 0.75,
       };
+
       const hf = {
-        emotions_avg: avg(pulled.map(p => p.hf_emotions_avg)) ?? 0.28,
-        emotion_entropy: avg(pulled.map(p => p.hf_entropy)) ?? 2.26,
-        core_entail: avg(pulled.map(p => p.hf_entail)) ?? 1.00,
-        core_contradict: avg(pulled.map(p => p.hf_contradict)) ?? 0.00,
+        emotions_avg:    avg(pulled.map(p => p.hf_emotions_avg)) ?? 0.28,
+        emotion_entropy: avg(pulled.map(p => p.hf_entropy))      ?? 2.26, // >1이면 자동 정규화됨
+        core_entail:     avg(pulled.map(p => p.hf_entail))       ?? 1.00,
+        core_contradict: avg(pulled.map(p => p.hf_contradict))   ?? 0.00,
         K: 10,
       };
 
@@ -476,37 +501,38 @@ export default function StrengthWeaknessPage() {
         labs.questions.forEach((x) => pushCount(counts.questions, x));
       }
       const labels = {
-        emotionsTop: topK(counts.emotions, 6),
+        emotionsTop:    topK(counts.emotions, 6),
         distortionsTop: topK(counts.distortions, 6),
-        coreTop: topK(counts.coreBeliefs, 6),
-        questionsTop: topK(counts.questions, 6),
+        coreTop:        topK(counts.coreBeliefs, 6),
+        questionsTop:   topK(counts.questions, 6),
       };
 
-      setSummary({ dateKey: active, convCount, msgCount, llm, hf, labels, hfCount });
+      setSummary({
+        dateKey: active, convCount, msgCount, llm, hf, labels, hfCount,
+        calibMode: calib.mode,
+      });
     })().catch(() => {
       setSummary({
         dateKey: active, convCount: 0, msgCount: 0,
-        llm: { emotions: 0.90, distortions: 0.80, core: 0.85, q: 0.75 },
-        hf: { emotions_avg: 0.28, emotion_entropy: 2.26, core_entail: 1.00, core_contradict: 0.00, K: 10 },
+        llm: { emotions_p:0.90, emotions_q:0.90, distortions_p:0.80, distortions_q:0.80, core_p:0.85, core_q:0.85, q_p:0.75, q_q:0.75 },
+        hf:  { emotions_avg:0.28, emotion_entropy:2.26, core_entail:1.00, core_contradict:0.00, K:10 },
         labels: { emotionsTop: [], distortionsTop: [], coreTop: [], questionsTop: [] },
-        hfCount: 0,
+        hfCount: 0, calibMode: 'none',
       });
     });
-  }, [active, authed]);
+  }, [active, authed, calib]);
 
-  const onOpenExplain = (key, val, extra) => setModal(buildExplain(key, val, extra));
+  const onOpenExplain = (key, payload, extra) => setModal(buildExplain(key, payload, extra));
   const diagnosis = useMemo(() => buildDiagnosis(summary), [summary]);
 
-  // =========================================================================
-  // 렌더
-  // =========================================================================
+  // ===== 렌더 =====
   return (
     <div className="page" style={{ width: '100%' }}>
       <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: 16, width: '100%' }}>
-        {/* 상단 헤더(월 네비) */}
+        {/* 상단 헤더 */}
         <div className="toolbar" style={{ gridColumn: '1 / -1', marginBottom: 8 }}>
-          <div className="title">강점 · 약점 분석 (세션별 상세)</div>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div className="title">계산식, 보정</div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             <button className="btn" onClick={() => {
               const d = new Date(pivot); setPivot(ymdKST(new Date(d.getFullYear(), d.getMonth() - 1, 1)));
             }} aria-label="이전 달">◀</button>
@@ -514,6 +540,11 @@ export default function StrengthWeaknessPage() {
             <button className="btn" onClick={() => {
               const d = new Date(pivot); setPivot(ymdKST(new Date(d.getFullYear(), d.getMonth() + 1, 1)));
             }} aria-label="다음 달">▶</button>
+
+            {/* 보정 상태 표시 (색 이름 클래스 사용) */}
+            <span className={`chip ${summary?.calibMode && summary.calibMode!=='none' ? 'green' : 'yellow'}`}>
+              보정: {summary?.calibMode || 'none'}
+            </span>
           </div>
         </div>
 
@@ -549,17 +580,17 @@ export default function StrengthWeaknessPage() {
                   <div className="panel-subtitle">평균 확신도 / 점수</div>
                   <div className="muted" style={{ marginBottom: 6, display: 'flex', gap: 8, alignItems: 'center' }}>
                     각 칩을 클릭하면 계산식·이유·개선점·HF→GPT 보정 흐름을 볼 수 있어요.
-                    <span className={`chip ${(summary?.hfCount || 0) > 0 ? 'good' : 'warn'}`}>
+                    <span className={`chip ${(summary?.hfCount || 0) > 0 ? 'green' : 'yellow'}`}>
                       HF 데이터: {(summary?.hfCount || 0) > 0 ? '정상' : '미수집'}
                     </span>
                   </div>
 
                   <div className="chips-col">
-                    {/* HF 먼저 */}
+                    {/* HF */}
                     <div className="muted label">HF</div>
                     {(() => {
-                      const toneAvg = lowEmotionInfo(summary.hf) ? 'info' : undefined;
-                      const toneNli = nliNoSignal(summary.hf) ? 'na' : undefined;
+                      const toneAvg = lowEmotionInfo(summary.hf) ? 'info' : undefined; // blue
+                      const toneNli = nliNoSignal(summary.hf) ? 'na' : undefined;    // gray
                       return (
                         <div className="chip-row">
                           <ScoreChip
@@ -571,7 +602,8 @@ export default function StrengthWeaknessPage() {
                           />
                           <ScoreChip
                             label="emotion_entropy (엔트로피)"
-                            value={summary.hf.emotion_entropy}
+                            value={entropyNorm(summary.hf.emotion_entropy, summary.hf.K || 10)}
+                            // 칩에는 정규화된 값 자체를 표시
                             kind="hf-entropy"
                             onClick={() => onOpenExplain('hf_entropy', summary.hf.emotion_entropy, { K: summary.hf.K || 10 })}
                           />
@@ -586,6 +618,7 @@ export default function StrengthWeaknessPage() {
                             label="core_contradict (NLI 반증)"
                             value={summary.hf.core_contradict}
                             kind="hf-nli"
+                            invert={true} // 낮을수록 좋음 → 색상 반전
                             tone={toneNli}
                             onClick={() => onOpenExplain('hf_contradict', summary.hf.core_contradict)}
                           />
@@ -593,33 +626,55 @@ export default function StrengthWeaknessPage() {
                       );
                     })()}
 
-                    {/* LLM 나중 */}
+                    {/* LLM (p→q) — 요청: 색상 제거(noColor) */}
                     <div className="muted label" style={{ marginTop: 10 }}>LLM</div>
                     <div className="chip-row">
-                      <ScoreChip label="감정 (확신도)" value={summary.llm.emotions} kind="llm"
-                        onClick={() => onOpenExplain('llm_emotions', summary.llm.emotions)} />
-                      <ScoreChip label="왜곡 (확신도)" value={summary.llm.distortions} kind="llm"
-                        onClick={() => onOpenExplain('llm_dist', summary.llm.distortions)} />
-                      <ScoreChip label="핵심믿음 (확신도)" value={summary.llm.core} kind="llm"
-                        onClick={() => onOpenExplain('llm_core', summary.llm.core)} />
-                      <ScoreChip label="질문 (확신도)" value={summary.llm.q} kind="llm"
-                        onClick={() => onOpenExplain('llm_q', summary.llm.q)} />
+                      <ScoreChip
+                        label="감정 (확신도)"
+                        value={summary.llm.emotions_p}
+                        cal={summary.llm.emotions_q}
+                        kind="llm"
+                        noColor
+                        onClick={() => onOpenExplain('llm_emotions', { p: summary.llm.emotions_p, q: summary.llm.emotions_q, mode: summary.calibMode })}
+                      />
+                      <ScoreChip
+                        label="왜곡 (확신도)"
+                        value={summary.llm.distortions_p}
+                        cal={summary.llm.distortions_q}
+                        kind="llm"
+                        noColor
+                        onClick={() => onOpenExplain('llm_dist', { p: summary.llm.distortions_p, q: summary.llm.distortions_q, mode: summary.calibMode })}
+                      />
+                      <ScoreChip
+                        label="핵심믿음 (확신도)"
+                        value={summary.llm.core_p}
+                        cal={summary.llm.core_q}
+                        kind="llm"
+                        noColor
+                        onClick={() => onOpenExplain('llm_core', { p: summary.llm.core_p, q: summary.llm.core_q, mode: summary.calibMode })}
+                      />
+                      <ScoreChip
+                        label="질문 (확신도)"
+                        value={summary.llm.q_p}
+                        cal={summary.llm.q_q}
+                        kind="llm"
+                        noColor
+                        onClick={() => onOpenExplain('llm_q', { p: summary.llm.q_p, q: summary.llm.q_q, mode: summary.calibMode })}
+                      />
                     </div>
                   </div>
                 </div>
 
+                {/* 간단 진단 */}
                 <div>
                   <div className="panel-subtitle">간단 진단</div>
                   <ul className="diagnosis">
                     {diagnosis.map((d, i) => {
-                      const label = d.cls === 'good' ? '양호'
-                        : d.cls === 'warn' ? '주의'
-                        : d.cls === 'bad'  ? '경고'
-                        : d.cls === 'info' ? '정보'
-                        : 'N/A';
+                      const label = labelForClass(d.cls);
+                      const colorCls = colorForClass(d.cls);
                       return (
-                        <li key={i} className={d.cls}>
-                          <span className={`diag-badge ${d.cls}`}>{label}</span>
+                        <li key={i} className={colorCls}>
+                          <span className={`diag-badge ${colorCls}`}>{label}</span>
                           <span>{d.text}</span>
                         </li>
                       );

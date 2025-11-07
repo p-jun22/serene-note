@@ -139,7 +139,7 @@ function CalibrationCard({ url, splitNote = '학습:평가 ≈ 66.7%와 33.3% (a
       </div>
       <div className="muted" style={{ marginBottom: 8, lineHeight: 1.3 }}>
         기간 {new Date(data.window.from).toLocaleDateString()} ~ {new Date(data.window.to).toLocaleDateString()} ·
-        표본 n={data.n} (양성 {data.positives}) · 모델 {data.calibrated.type} ·
+        모델 {data.calibrated.type} ·
         학습:평가 ≈ 66.7%와 33.3% (admin+일반유저1 vs qwer일반유저2)
       </div>
 
